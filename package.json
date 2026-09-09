@@ -1,0 +1,39 @@
+{
+  "name": "dsh-antigravity",
+  "version": "0.1.0",
+  "description": "适用于 DeepSeek Harness 的 Google Antigravity 模型提供商适配器插件（移植自 omp）",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "dsh-antigravity": "./bin.js"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "test": "node test/test.js"
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh-llm": "^0.1.5-alpha.1",
+    "@deepseek-ai/schemastery": "^3.18.2"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-llm": "^0.1.5-alpha.1"
+  },
+  "keywords": [
+    "dsh",
+    "antigravity",
+    "gemini",
+    "claude",
+    "llm",
+    "cordis"
+  ],
+  "license": "MIT"
+}
