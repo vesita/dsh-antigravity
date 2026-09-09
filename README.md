@@ -1,82 +1,154 @@
 # dsh-antigravity
 
-适用于 DeepSeek Harness (DSH) 的 Google Antigravity 模型提供商适配器插件（从 Oh My Pi 移植）。
+DeepSeek Harness (DSH) 的 **Google Antigravity** 模型提供商插件：原生 `LlmAdapter` 实现 + 内置登录 UI + 自有凭据存储。
 
-## 功能特性
+> **不再依赖 omp。** 旧版会读写 `~/.omp/agent/agent.db` 复用 Oh My Pi 的登录态；本版完全移除了该耦合，凭据只落在 DSH 自己的 `ctx.credentials` 记录与 `~/.dsh/antigravity-auth.json`（0600）中。
 
-- **无缝复用 omp OAuth 凭据**：自动读取 `~/.omp/agent/agent.db` 中现有的 Google Antigravity OAuth 认证凭据。如果在 `omp` 中已执行过 `/login google-antigravity`，无需重复登录即可直接使用。
-- **OAuth Token 自动刷新**：Access Token 过期时，自动使用 Antigravity 客户端凭证向 Google OAuth 端点（`https://oauth2.googleapis.com/token`）换取新令牌并持久化保存。
-- **原生 DSH LlmAdapter 实现**：完整实现 `@deepseek-ai/dsh-llm` 的 `LlmAdapter` 规范，原生支持 DSH 的 `StreamChunk` 事件流（包含 `reasoning-delta` 思考过程、`text-delta` 文本增量、`tool-call-delta` 工具调用及 `usage` Token 统计）。
-- **全系列 Antigravity 模型支持**：
-  - `gemini-3.8-flash`（映射至 `gemini-3.8-flash-tiered`，1M 上下文，支持多模态）
-  - `gemini-3.7-flash`（映射至 `gemini-3.7-flash-tiered`，1M 上下文）
-  - `gemini-3.6-flash`（映射至 `gemini-3.6-flash-tiered`）
-  - `gemini-3.5-flash`（映射至 `gemini-3.5-flash-low`）
-  - `gemini-3.1-pro` / `gemini-3-pro` / `gemini-2.5-pro` / `gemini-2.5-flash`
-  - `claude-sonnet-4-6`（通过 Cloud Code Assist 路由）
-  - `claude-opus-4-6-thinking`（通过 Cloud Code Assist 路由）
-  - `gpt-oss-120b`（映射至 `gpt-oss-120b-medium`）
-- **独立内置 OpenAI 兼容代理**：内置轻量 HTTP 代理服务器，可直接为标准 `/v1/chat/completions` 客户端提供服务，亦兼容 DSH Web 界面配置。
+---
+
+## 它解决了什么
+
+| 旧版问题 | 本版做法 |
+| --- | --- |
+| 在 `llm-pi-ai` 命名空间下声明 `providers.google-antigravity`，但 pi-ai 没有该路由的内置目录且配置里没有 `models`，触发 `llm-pi-ai: provider "google-antigravity" resolves no models` | 提供商目录改挂插件自有的 `llm-antigravity` 命名空间；`google-antigravity` 只由原生适配器提供，pi-ai 完全不参与 |
+| 只有 CLI 能登录，设置页没有登录入口 | 通过 `settings.models.provider-card` 插槽在「设置 → 模型 → Google Antigravity」卡片内提供登录 / 退出 / 状态 UI |
+| 读写 `~/.omp/agent/agent.db`，退出登录会删除 omp 的记录 | 凭据写入 `ctx.credentials`（`dsh-antigravity/google-antigravity` 记录）并镜像到 `~/.dsh/antigravity-auth.json` |
+| 每次 DSH 启动都强占 8045 端口跑代理 | OpenAI 兼容代理改为**可选**（`proxy.enabled`，默认关闭） |
+| 适配器把带 `thoughtSignature` 的普通文本误判为思考过程；`block-end` 文本错位；工具调用被 `MAX_TOKENS` 覆盖 | 只以 `part.thought === true` 判定思考；块状态机重写；工具调用优先于 `max-tokens` |
 
 ---
 
 ## 在 DSH 中使用
 
-### 方式一：原生 DSH 插件模式（推荐，零常驻进程）
+插件随 profile bundle 加载，无需额外配置即可在模型选择器中出现 `google-antigravity`。
 
-可直接作为 DSH 插件加载运行。
+### 登录
 
-如需将 `google-antigravity` 设为 DSH 的默认模型，在 `~/.dsh/settings.yaml` 中配置即可：
+1. 打开 **设置 → 模型**；
+2. 找到 **Google Antigravity** 卡片；
+3. 点击 **登录 Google 账号**，浏览器打开 Google 授权页；
+4. 授权后回到 DSH，卡片显示账号与项目 ID。
+
+也可以在终端登录：
+
+```bash
+dsh-antigravity login      # 浏览器 OAuth 登录
+dsh-antigravity status     # 查看登录状态与模型列表
+dsh-antigravity logout     # 退出并清除本地凭据
+dsh-antigravity refresh    # 强制刷新 access token
+```
+
+### 选为默认模型
 
 ```yaml
+# ~/.dsh/settings.yaml
 agent-default-model:
   provider: google-antigravity
   model: gemini-3.8-flash
   reasoningEffort: high
 ```
 
-### 方式二：独立 OpenAI 兼容代理模式
+### 可选：OpenAI 兼容代理
 
-也可以在本地端口启动代理服务：
+给不能加载 DSH 插件的客户端（脚本、其他编辑器）使用：
+
+```yaml
+# ~/.dsh/settings.yaml
+llm-antigravity:
+  proxy:
+    enabled: true
+    host: 127.0.0.1
+    port: 8045
+```
+
+或独立启动：
 
 ```bash
 dsh-antigravity proxy --port 8045
 ```
 
-然后在 `~/.dsh/settings.yaml` 中配置自定义提供商：
-
-```yaml
-llm-pi-ai:
-  providers:
-    antigravity:
-      displayName: Google Antigravity
-      api: openai-completions
-      baseURL: http://127.0.0.1:8045/v1
-      apiKeyEnv: ANTIGRAVITY_API_KEY
-      models:
-        - id: gemini-3.8-flash
-          contextWindow: 1048576
-        - id: claude-sonnet-4-6
-          contextWindow: 250000
-```
+端点：`GET /v1/models`、`GET /v1/auth/status`、`POST /v1/chat/completions`。
 
 ---
 
-## CLI 命令说明
+## 设置项（`~/.dsh/settings.yaml` → `llm-antigravity`）
+
+| 字段 | 默认 | 说明 |
+| --- | --- | --- |
+| `models` | 内置 11 个模型 | 可覆盖/增删；每项含 `id`、`wireId`、`name`、`contextWindow`、`maxTokens`、`reasoning`、`inputModalities` |
+| `endpoint` | `https://daily-cloudcode-pa.googleapis.com` | 首选端点，失败后回退到内置端点列表 |
+| `projectId` | 登录时自动发现 | Antigravity 项目 ID，缺省 `aicode-consumers` |
+| `clientId` / `clientSecret` | 内置 Antigravity 客户端 | 可用环境变量覆盖，见下 |
+| `redirectUri` | `http://127.0.0.1:51121/oauth-callback` | 必须与 OAuth 客户端注册的回调一致 |
+| `reasoningEffort` | `high` | `off` / `low` / `high`；`low`/`high` 仅对 `gemini-3*` 发送 `thinkingLevel` |
+| `retryPolicy` | `{ mode: normal, maxRetries: 3 }` | 透传 DSH 重试策略 |
+| `proxy` | `{ enabled: false, host: 127.0.0.1, port: 8045 }` | 可选 OpenAI 兼容代理 |
+
+环境变量覆盖（优先级高于内置客户端，低于设置项）：
 
 ```bash
-# 查看认证状态与可用模型列表
-dsh-antigravity status
-
-# 登录 Google 账号（发起 OAuth 授权）
-dsh-antigravity login
-
-# 退出登录并清除本地存储的凭据
-dsh-antigravity logout
-
-# 强制刷新 Google OAuth 访问令牌
-dsh-antigravity refresh
-
-# 启动独立 OpenAI 兼容代理服务（默认端口 8045）
-dsh-antigravity proxy --port 8045
+export DSH_ANTIGRAVITY_CLIENT_ID=...
+export DSH_ANTIGRAVITY_CLIENT_SECRET=...
 ```
+
+也兼容旧名 `GOOGLE_ANTIGRAVITY_CLIENT_ID` / `ANTIGRAVITY_CLIENT_ID`。
+
+---
+
+## 凭据存放位置
+
+| 位置 | 用途 |
+| --- | --- |
+| `ctx.credentials` 记录 `dsh-antigravity/google-antigravity` | DSH 内的唯一事实源；登录流程必须在此提交记录 |
+| `~/.dsh/antigravity-auth.json`（0600） | 独立 CLI / 代理的镜像，同时兼容已有安装 |
+| `GOOGLE_ANTIGRAVITY_DATA` / `GOOGLE_ANTIGRAVITY_TOKEN` | 环境变量注入，优先级最高 |
+
+> 登录成功后会同时写记录与镜像文件；退出登录会清除两者。任何路径都不会触碰 `~/.omp`。
+
+---
+
+## 架构
+
+```
+src/
+├── index.js      Host 插件：自有 settings 命名空间、原生适配器注册、
+│                 authorization 登录 flow、/dsh-antigravity/auth/* 回环路由、可选代理
+├── client.js     浏览器半：settings.models.provider-card 卡片内登录 UI
+├── adapter.js    原生 LlmAdapter：请求构造 + SSE → DSH StreamChunk
+├── auth.js       OAuth 端点、客户端解析、凭据分层读写、刷新
+├── auth-flow.js  单次 OAuth 尝试的本地回调监听（Web / flow / CLI 共用）
+├── proxy.js      可选 OpenAI 兼容代理
+└── models.js     模型目录与 id/wireId 解析
+```
+
+### DSH 集成点
+
+- `ctx.llm.registerAdapter(['google-antigravity'], adapter)` — 原生路由；
+- `ctx.llm.registerConfigurableProviders([{ settingsNs: 'llm-antigravity', settingsPath: [], declared: false }])` — 设置页目录条目；
+- `ctx.settings.installSection(ctx, 'llm-antigravity', Config, ...)` — 自有设置命名空间；
+- `ctx.authorization.registerFlow({ key, label, methods, run })` — 无头/ACP 登录；
+- `ctx.webServer.register({ kind: 'exact', path: '/dsh-antigravity/auth/...' })` — 浏览器登录回环路由（经 `ctx.connection.requestRejection` 校验）；
+- `settings.models.provider-card` 键 `llm-antigravity` — 卡片扩展区。
+
+---
+
+## 开发
+
+```bash
+pnpm install
+node test/test.js          # 34 项单元测试，无网络、无真实凭据
+```
+
+测试覆盖：模型解析、凭据记录封装、OAuth URL、请求构造、SSE 解析、用量映射、Cordis 注册（断言目录条目落在 `llm-antigravity` 而非 `llm-pi-ai`）、浏览器半插槽注册。
+
+---
+
+## 安全说明
+
+- 内置 OAuth 客户端是 Antigravity 桌面客户端凭据，无法真正保密；请通过 `clientId`/`clientSecret` 设置项或环境变量使用你自己的客户端。
+- 回环路由仅在 DSH 的 Web 载体下注册，并经过 Host/Origin 与浏览器认证校验；无 `connection` 服务时不注册。
+- 凭据文件权限为 0600，且不会写入任何第三方应用的数据库。
+
+## License
+
+MIT

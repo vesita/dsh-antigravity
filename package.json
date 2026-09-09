@@ -1,11 +1,12 @@
 {
   "name": "dsh-antigravity",
-  "version": "0.1.0",
-  "description": "适用于 DeepSeek Harness 的 Google Antigravity 模型提供商适配器插件（移植自 omp）",
+  "version": "0.2.0",
+  "description": "适用于 DeepSeek Harness 的 Google Antigravity 模型提供商适配器插件（原生 LlmAdapter + 内置登录 UI）",
   "type": "module",
   "main": "src/index.js",
   "exports": {
     ".": "./src/index.js",
+    "./client": "./src/client.js",
     "./package.json": "./package.json"
   },
   "bin": {
@@ -14,6 +15,10 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": []
     }
   },
   "scripts": {

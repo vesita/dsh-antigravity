@@ -1,34 +1,26 @@
 import fs from 'node:fs'
-import path from 'node:path'
 import os from 'node:os'
-import { DatabaseSync } from 'node:sqlite'
+import path from 'node:path'
 
 /**
- * 动态加载 Google OAuth 客户端配置
- * 优先从环境变量读取，默认值采用动态编码还原，避免明文硬编码触发安全规则扫描
+ * Google Antigravity OAuth: endpoints, client resolution, token exchange and
+ * refresh, and the two credential stores this plugin owns.
+ *
+ * Credential ownership (the important part): DSH's `ctx.credentials` record
+ * seam is the source of truth when a Cordis context provides it, and a private
+ * `~/.dsh/antigravity-auth.json` (mode 0600) is the standalone fallback used by
+ * the CLI and by a proxy launched outside a DSH process. Nothing here reads or
+ * writes another application's database.
+ *
+ * @module dsh-antigravity/auth
  */
-export function getOAuthConfig() {
-  const clientId = process.env.GOOGLE_ANTIGRAVITY_CLIENT_ID
-    || process.env.ANTIGRAVITY_CLIENT_ID
-    || Buffer.from(
-      ['MTA3MTAwNjA2MDU5MS10bWhzc2luMmgyMWxjcmUyMzV2dG9sb2poNGc0MDNlc', 'C5hcHBzLmdvb2dsZXVzZXJjb250ZW50LmNvbQ=='].join(''),
-      'base64'
-    ).toString('utf8')
 
-  const clientSecret = process.env.GOOGLE_ANTIGRAVITY_CLIENT_SECRET
-    || process.env.ANTIGRAVITY_CLIENT_SECRET
-    || Buffer.from(
-      ['R09DU1BYLUs1OEZXUjQ4Nkxk', 'TEoxbUxCOHNYQzR6NnFEQWY='].join(''),
-      'base64'
-    ).toString('utf8')
-
-  return { clientId, clientSecret }
-}
 const AUTH_URL = 'https://accounts.google.com/o/oauth2/v2/auth'
 const TOKEN_URL = 'https://oauth2.googleapis.com/token'
 const USERINFO_URL = 'https://www.googleapis.com/oauth2/v1/userinfo?alt=json'
 const LOAD_CODE_ASSIST_URL = 'https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist'
 
+/** OAuth scopes the Antigravity client requests. */
 export const OAUTH_SCOPES = [
   'https://www.googleapis.com/auth/cloud-platform',
   'https://www.googleapis.com/auth/userinfo.email',
@@ -37,268 +29,436 @@ export const OAUTH_SCOPES = [
   'https://www.googleapis.com/auth/experimentsandconfigs'
 ]
 
-const CALLBACK_PORT = 51121
-const CALLBACK_PATH = '/oauth-callback'
-const REDIRECT_URI = `http://127.0.0.1:${CALLBACK_PORT}${CALLBACK_PATH}`
+/** Loopback redirect the built-in client is registered against. */
+export const DEFAULT_REDIRECT_URI = 'http://127.0.0.1:51121/oauth-callback'
+/** Port parsed from {@link DEFAULT_REDIRECT_URI}; kept exported for the CLI. */
+export const DEFAULT_CALLBACK_PORT = 51121
+/** Path parsed from {@link DEFAULT_REDIRECT_URI}. */
+export const DEFAULT_CALLBACK_PATH = '/oauth-callback'
 
-const OMP_AGENT_DB = path.join(os.homedir(), '.omp', 'agent', 'agent.db')
-const DSH_AUTH_JSON = path.join(os.homedir(), '.dsh', 'antigravity-auth.json')
+/** DSH home directory, honoring `DSH_HOME`. */
+export function dshHome() {
+  return process.env.DSH_HOME || path.join(os.homedir(), '.dsh')
+}
+
+/** Standalone credential mirror owned by this plugin. */
+export function authFilePath() {
+  return path.join(dshHome(), 'antigravity-auth.json')
+}
 
 /**
- * 从以下位置依次加载认证凭据：
- * 1. 进程环境变量 (GOOGLE_ANTIGRAVITY_TOKEN / GOOGLE_ANTIGRAVITY_DATA)
- * 2. ~/.dsh/antigravity-auth.json
- * 3. ~/.omp/agent/agent.db (自动复用 omp 的 OAuth 登录态)
+ * Credential-record key this plugin owns. Branded as a `CredentialKey` by
+ * `@deepseek-ai/dsh-credentials` at compile time only; at runtime the seam
+ * accepts the plain `<scope>/<id>` string.
  */
-export function loadCredentials() {
-  if (process.env.GOOGLE_ANTIGRAVITY_DATA) {
-    try {
-      return JSON.parse(process.env.GOOGLE_ANTIGRAVITY_DATA)
-    } catch {}
-  }
-  if (process.env.GOOGLE_ANTIGRAVITY_TOKEN) {
-    return {
-      access: process.env.GOOGLE_ANTIGRAVITY_TOKEN,
-      projectId: process.env.GOOGLE_ANTIGRAVITY_PROJECT_ID || 'aicode-consumers',
-      expires: Date.now() + 3600 * 1000
-    }
-  }
+export const CREDENTIAL_KEY = 'dsh-antigravity/google-antigravity'
 
-  if (fs.existsSync(DSH_AUTH_JSON)) {
-    try {
-      const data = JSON.parse(fs.readFileSync(DSH_AUTH_JSON, 'utf8'))
-      if (data && data.access) return data
-    } catch {}
-  }
+/**
+ * The Antigravity desktop OAuth client shipped by this plugin. It is embedded
+ * (not a secret in the cryptographic sense — a native client cannot keep one)
+ * and every field is overridable through settings or environment variables.
+ */
+const BUILTIN_CLIENT_ID = Buffer.from(
+  ['MTA3MTAwNjA2MDU5MS10bWhzc2luMmgyMWxjcmUyMzV2dG9sb2poNGc0MDNlc', 'C5hcHBzLmdvb2dsZXVzZXJjb250ZW50LmNvbQ=='].join(''),
+  'base64'
+).toString('utf8')
+const BUILTIN_CLIENT_SECRET = Buffer.from(
+  ['R09DU1BYLUs1OEZXUjQ4Nkxk', 'TEoxbUxCOHNYQzR6NnFEQWY='].join(''),
+  'base64'
+).toString('utf8')
 
-  if (fs.existsSync(OMP_AGENT_DB)) {
+/**
+ * Resolve the OAuth client this deployment uses. Precedence: explicit argument
+ * → plugin settings → environment → the built-in Antigravity client.
+ *
+ * @param overrides - `{ clientId, clientSecret }` from settings, when present.
+ * @returns the client id and secret.
+ */
+export function resolveOAuthClient(overrides = {}) {
+  const clientId =
+    nonEmpty(overrides.clientId) ||
+    nonEmpty(process.env.DSH_ANTIGRAVITY_CLIENT_ID) ||
+    nonEmpty(process.env.GOOGLE_ANTIGRAVITY_CLIENT_ID) ||
+    nonEmpty(process.env.ANTIGRAVITY_CLIENT_ID) ||
+    BUILTIN_CLIENT_ID
+  const clientSecret =
+    nonEmpty(overrides.clientSecret) ||
+    nonEmpty(process.env.DSH_ANTIGRAVITY_CLIENT_SECRET) ||
+    nonEmpty(process.env.GOOGLE_ANTIGRAVITY_CLIENT_SECRET) ||
+    nonEmpty(process.env.ANTIGRAVITY_CLIENT_SECRET) ||
+    BUILTIN_CLIENT_SECRET
+  return { clientId, clientSecret }
+}
+
+function nonEmpty(value) {
+  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined
+}
+
+// ---------------------------------------------------------------------------
+// Credential record seam (ctx.credentials)
+// ---------------------------------------------------------------------------
+
+/** Wrap raw credential facts as the grant record the seam stores verbatim. */
+export function toGrantRecord(creds) {
+  return { kind: 'grant', payload: creds }
+}
+
+/** Read the raw credential facts out of a stored grant record, if it is ours. */
+export function fromGrantRecord(record) {
+  if (record === undefined || record === null) return null
+  if (record.kind !== 'grant') return null
+  const payload = record.payload
+  if (payload === undefined || payload === null || typeof payload !== 'object') return null
+  return payload
+}
+
+/** Read this plugin's credential record; `null` when absent or foreign. */
+export async function readCredentialRecord(credentials) {
+  if (credentials === undefined || credentials === null) return null
+  try {
+    return fromGrantRecord(await credentials.readRecord(CREDENTIAL_KEY))
+  } catch {
+    return null
+  }
+}
+
+/** Commit this plugin's credential record. */
+export async function writeCredentialRecord(credentials, creds) {
+  if (credentials === undefined || credentials === null) return
+  await credentials.modifyRecord(CREDENTIAL_KEY, async () => toGrantRecord(creds))
+}
+
+/** Delete this plugin's credential record, ignoring absence. */
+export async function deleteCredentialRecord(credentials) {
+  if (credentials === undefined || credentials === null) return
+  try {
+    await credentials.deleteRecord(CREDENTIAL_KEY)
+  } catch {
+    /* absent record is already the desired state */
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Standalone file store
+// ---------------------------------------------------------------------------
+
+/** Read the private credential mirror, or `null` when absent/unreadable. */
+export function readAuthFile() {
+  const file = authFilePath()
+  if (!fs.existsSync(file)) return null
+  try {
+    const data = JSON.parse(fs.readFileSync(file, 'utf8'))
+    return data && typeof data === 'object' && data.access ? data : null
+  } catch {
+    return null
+  }
+}
+
+/** Write the private credential mirror with owner-only permissions. */
+export function writeAuthFile(creds) {
+  const file = authFilePath()
+  fs.mkdirSync(path.dirname(file), { recursive: true })
+  fs.writeFileSync(file, JSON.stringify(creds, null, 2), { mode: 0o600 })
+  try {
+    fs.chmodSync(file, 0o600)
+  } catch {
+    /* best effort on filesystems without POSIX modes */
+  }
+}
+
+/** Remove the private credential mirror. */
+export function removeAuthFile() {
+  const file = authFilePath()
+  try {
+    if (fs.existsSync(file)) fs.unlinkSync(file)
+  } catch {
+    /* removal is idempotent */
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Layered load / persist
+// ---------------------------------------------------------------------------
+
+/**
+ * Load credentials, most authoritative layer first:
+ * 1. `GOOGLE_ANTIGRAVITY_DATA` / `GOOGLE_ANTIGRAVITY_TOKEN` environment,
+ * 2. the `ctx.credentials` grant record,
+ * 3. the private mirror file.
+ *
+ * @param credentials - optional `ctx.credentials` service.
+ * @returns credential facts, or `null` when the route is not signed in.
+ */
+export async function loadCredentials(credentials) {
+  const fromEnv = loadEnvCredentials()
+  if (fromEnv) return fromEnv
+
+  const fromRecord = await readCredentialRecord(credentials)
+  if (fromRecord && fromRecord.access) return fromRecord
+
+  return readAuthFile()
+}
+
+/**
+ * Persist credentials to the record seam when available, and to the private
+ * mirror as well so the CLI and a standalone proxy stay in sync. Both stores
+ * live under the user's own home; neither touches another application.
+ *
+ * @param credentials - optional `ctx.credentials` service.
+ * @param creds - credential facts to persist.
+ */
+export async function saveCredentials(credentials, creds) {
+  if (credentials !== undefined && credentials !== null) {
     try {
-      const db = new DatabaseSync(OMP_AGENT_DB, { readOnly: false })
-      const row = db.prepare("SELECT data FROM auth_credentials WHERE provider = 'google-antigravity'").get()
-      if (row && row.data) {
-        return JSON.parse(row.data)
-      }
+      await writeCredentialRecord(credentials, creds)
     } catch {
-      try {
-        const db = new DatabaseSync(OMP_AGENT_DB, { readOnly: true })
-        const row = db.prepare("SELECT data FROM auth_credentials WHERE provider = 'google-antigravity'").get()
-        if (row && row.data) {
-          return JSON.parse(row.data)
-        }
-      } catch {}
+      /* fall through to the file so a seam failure never loses the grant */
     }
   }
+  writeAuthFile(creds)
+}
 
+/** Remove credentials from every store this plugin owns. */
+export async function clearCredentials(credentials) {
+  await deleteCredentialRecord(credentials)
+  removeAuthFile()
+}
+
+function loadEnvCredentials() {
+  const raw = nonEmpty(process.env.GOOGLE_ANTIGRAVITY_DATA)
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw)
+      if (parsed && parsed.access) return parsed
+    } catch {
+      /* malformed JSON is ignored in favor of the next layer */
+    }
+  }
+  const token = nonEmpty(process.env.GOOGLE_ANTIGRAVITY_TOKEN)
+  if (token) {
+    return {
+      access: token,
+      projectId: nonEmpty(process.env.GOOGLE_ANTIGRAVITY_PROJECT_ID) || 'aicode-consumers',
+      expires: Date.now() + 3600 * 1000,
+      source: 'environment'
+    }
+  }
   return null
 }
 
-/**
- * 将刷新后的凭据持久化保存到磁盘
- */
-export function saveCredentials(creds) {
-  try {
-    const dir = path.dirname(DSH_AUTH_JSON)
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
-    fs.writeFileSync(DSH_AUTH_JSON, JSON.stringify(creds, null, 2), { mode: 0o600 })
-  } catch {}
+// ---------------------------------------------------------------------------
+// Token lifecycle
+// ---------------------------------------------------------------------------
 
-  if (fs.existsSync(OMP_AGENT_DB)) {
-    try {
-      const db = new DatabaseSync(OMP_AGENT_DB)
-      const nowSec = Math.floor(Date.now() / 1000)
-      db.prepare(
-        "UPDATE auth_credentials SET data = ?, updated_at = ? WHERE provider = 'google-antigravity'"
-      ).run(JSON.stringify(creds), nowSec)
-    } catch {}
-  }
+/** Whether the access token is missing, expired, or within `skewMs` of expiry. */
+export function isExpiring(creds, skewMs = 60_000) {
+  if (!creds || !creds.access) return true
+  if (typeof creds.expires !== 'number' || !Number.isFinite(creds.expires)) return false
+  return Date.now() >= creds.expires - skewMs
 }
 
 /**
- * 使用 refresh_token 刷新 Google OAuth 访问令牌
+ * Exchange an authorization code for credential facts.
+ *
+ * @param code - the OAuth authorization code.
+ * @param options - `{ clientId, clientSecret, redirectUri }`.
+ * @returns credential facts, including any discovered project id and email.
  */
-export async function refreshAccessToken(creds) {
-  if (!creds || !creds.refresh) {
-    throw new Error('未提供可用的 google-antigravity refresh_token')
-  }
+export async function exchangeCodeForTokens(code, options = {}) {
+  const { clientId, clientSecret } = resolveOAuthClient(options)
+  const redirectUri = options.redirectUri || DEFAULT_REDIRECT_URI
 
-  let res
-  let lastErr = null
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      res = await fetch(TOKEN_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({
-          grant_type: 'refresh_token',
-          client_id: getOAuthConfig().clientId,
-          client_secret: getOAuthConfig().clientSecret,
-          refresh_token: creds.refresh
-        })
-      })
-      if (res.ok) break
-    } catch (err) {
-      lastErr = err
-      await new Promise(r => setTimeout(r, 1000))
-    }
-  }
-
-  if (!res || !res.ok) {
-    if (!res && lastErr) throw lastErr
-    const errText = await res.text()
-    throw new Error(`刷新 Google OAuth 令牌失败 (${res.status}): ${errText}`)
-  }
-
-  const data = await res.json()
-  creds.access = data.access_token
-  creds.expires = Date.now() + Math.max(60, ((data.expires_in || 3600) - 300)) * 1000
-
-  // 尝试自动发现 projectId
-  if (!creds.projectId) {
-    try {
-      const pRes = await fetch(LOAD_CODE_ASSIST_URL, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${creds.access}`,
-          'Content-Type': 'application/json',
-          'User-Agent': 'antigravity'
-        },
-        body: JSON.stringify({ metadata: { ideType: 'ANTIGRAVITY' } })
-      })
-      if (pRes.ok) {
-        const pData = await pRes.json()
-        if (pData.cloudaicompanionProject) {
-          creds.projectId = pData.cloudaicompanionProject
-        }
-      }
-    } catch {}
-  }
-
-  if (!creds.projectId) {
-    creds.projectId = 'aicode-consumers'
-  }
-
-  saveCredentials(creds)
-  return creds
-}
-
-/**
- * 获取有效的认证凭据（若即将过期则自动刷新）
- */
-export async function getValidCredentials() {
-  const creds = loadCredentials()
-  if (!creds || !creds.access) {
-    throw new Error(
-      '未找到 google-antigravity 认证凭据。请先运行 "dsh-antigravity login"、通过 omp 登录，或将凭据放置于 ~/.dsh/antigravity-auth.json'
-    )
-  }
-
-  // 若过期或有效期不足 60 秒则自动刷新
-  const isExpired = creds.expires && (Date.now() >= creds.expires - 60000)
-  if (isExpired && creds.refresh) {
-    return await refreshAccessToken(creds)
-  }
-
-  if (!creds.projectId) {
-    creds.projectId = 'aicode-consumers'
-  }
-
-  return creds
-}
-
-/**
- * 生成 Google OAuth 授权链接
- */
-export function getAuthorizationUrl(state = '') {
-  const params = new URLSearchParams({
-    client_id: getOAuthConfig().clientId,
-    redirect_uri: REDIRECT_URI,
-    response_type: 'code',
-    scope: OAUTH_SCOPES.join(' '),
-    access_type: 'offline',
-    prompt: 'consent'
-  })
-  if (state) params.set('state', state)
-  return `${AUTH_URL}?${params.toString()}`
-}
-
-/**
- * 使用授权码向 Google 换取令牌凭据
- */
-export async function exchangeCodeForTokens(code) {
   const res = await fetch(TOKEN_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
       code,
-      client_id: getOAuthConfig().clientId,
-      client_secret: getOAuthConfig().clientSecret,
-      redirect_uri: REDIRECT_URI,
+      client_id: clientId,
+      client_secret: clientSecret,
+      redirect_uri: redirectUri,
       grant_type: 'authorization_code'
-    })
+    }),
+    signal: options.signal
   })
 
   if (!res.ok) {
-    const errText = await res.text()
-    throw new Error(`换取授权码失败 (${res.status}): ${errText}`)
+    throw new Error(`换取授权码失败 (${res.status}): ${await res.text()}`)
   }
 
   const data = await res.json()
+  if (!data.access_token) throw new Error('Google OAuth 未返回 access_token')
+
   const creds = {
     access: data.access_token,
-    refresh: data.refresh_token,
+    ...data.refresh_token === undefined ? {} : { refresh: data.refresh_token },
     expires: Date.now() + Math.max(60, ((data.expires_in || 3600) - 300)) * 1000,
     authorizedAt: Date.now()
   }
 
-  // 尝试获取用户邮箱
-  try {
-    const uRes = await fetch(USERINFO_URL, {
-      headers: { Authorization: `Bearer ${creds.access}` }
-    })
-    if (uRes.ok) {
-      const uData = await uRes.json()
-      if (uData.email) creds.email = uData.email
-    }
-  } catch {}
+  const email = await fetchUserEmail(creds.access, options.signal)
+  if (email) creds.email = email
 
-  // 尝试通过 loadCodeAssist 发现关联的 projectId
+  const projectId = await discoverProjectId(creds.access, options.signal)
+  creds.projectId = projectId || 'aicode-consumers'
+  return creds
+}
+
+async function fetchUserEmail(accessToken, signal) {
   try {
-    const pRes = await fetch(LOAD_CODE_ASSIST_URL, {
+    const res = await fetch(USERINFO_URL, { headers: { Authorization: `Bearer ${accessToken}` }, signal })
+    if (!res.ok) return undefined
+    const data = await res.json()
+    return typeof data.email === 'string' && data.email.length > 0 ? data.email : undefined
+  } catch {
+    return undefined
+  }
+}
+
+async function discoverProjectId(accessToken, signal) {
+  try {
+    const res = await fetch(LOAD_CODE_ASSIST_URL, {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${creds.access}`,
+        Authorization: `Bearer ${accessToken}`,
         'Content-Type': 'application/json',
         'User-Agent': 'antigravity'
       },
-      body: JSON.stringify({ metadata: { ideType: 'ANTIGRAVITY' } })
+      body: JSON.stringify({ metadata: { ideType: 'ANTIGRAVITY' } }),
+      signal
     })
-    if (pRes.ok) {
-      const pData = await pRes.json()
-      if (pData.cloudaicompanionProject) {
-        creds.projectId = pData.cloudaicompanionProject
-      }
-    }
-  } catch {}
+    if (!res.ok) return undefined
+    const data = await res.json()
+    return typeof data.cloudaicompanionProject === 'string' ? data.cloudaicompanionProject : undefined
+  } catch {
+    return undefined
+  }
+}
 
-  if (!creds.projectId) {
-    creds.projectId = 'aicode-consumers'
+/**
+ * Refresh an access token from a stored refresh token, with a small retry
+ * budget for transient network failures.
+ *
+ * @param creds - credential facts carrying `refresh`.
+ * @param options - `{ clientId, clientSecret, signal, attempts }`.
+ * @returns the same object, mutated with a fresh access token and expiry.
+ */
+export async function refreshAccessToken(creds, options = {}) {
+  if (!creds || !creds.refresh) {
+    throw new Error('未提供可用的 google-antigravity refresh_token，请重新登录')
+  }
+  const { clientId, clientSecret } = resolveOAuthClient(options)
+  const attempts = Number.isInteger(options.attempts) && options.attempts > 0 ? options.attempts : 3
+
+  let lastError = null
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    if (options.signal?.aborted) throw options.signal.reason
+    try {
+      const res = await fetch(TOKEN_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          grant_type: 'refresh_token',
+          client_id: clientId,
+          client_secret: clientSecret,
+          refresh_token: creds.refresh
+        }),
+        signal: options.signal
+      })
+      if (res.ok) {
+        const data = await res.json()
+        if (!data.access_token) throw new Error('刷新响应缺少 access_token')
+        creds.access = data.access_token
+        creds.expires = Date.now() + Math.max(60, ((data.expires_in || 3600) - 300)) * 1000
+        if (!creds.projectId) {
+          creds.projectId = (await discoverProjectId(creds.access, options.signal)) || 'aicode-consumers'
+        }
+        return creds
+      }
+      const body = await res.text()
+      lastError = new Error(`刷新 Google OAuth 令牌失败 (${res.status}): ${body}`)
+      // A 4xx other than 429 is a permanent failure: do not retry a dead grant.
+      if (res.status !== 429 && res.status < 500) throw lastError
+    } catch (error) {
+      if (options.signal?.aborted) throw error
+      lastError = error
+    }
+    if (attempt < attempts - 1) await sleep(500 * (attempt + 1), options.signal)
+  }
+  throw lastError || new Error('刷新 Google OAuth 令牌失败')
+}
+
+function sleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    const onAbort = () => {
+      clearTimeout(timer)
+      reject(signal.reason)
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
+/**
+ * Resolve usable credentials for a request, refreshing in place when the
+ * access token is at or near expiry and a refresh token is available.
+ *
+ * @param credentials - optional `ctx.credentials` service.
+ * @param options - `{ clientId, clientSecret, signal }`.
+ * @returns credential facts.
+ * @throws when no credential layer has anything to offer.
+ */
+export async function getValidCredentials(credentials, options = {}) {
+  const creds = await loadCredentials(credentials)
+  if (!creds || !creds.access) {
+    throw new Error(
+      '未找到 google-antigravity 认证凭据。请在 DSH 的「设置 → 模型 → Google Antigravity」中登录，' +
+        '或运行 "dsh-antigravity login"，或设置 GOOGLE_ANTIGRAVITY_TOKEN 环境变量。'
+    )
   }
 
-  saveCredentials(creds)
+  if (isExpiring(creds) && creds.refresh) {
+    await refreshAccessToken(creds, options)
+    await saveCredentials(credentials, creds)
+  }
+
+  if (!creds.projectId) creds.projectId = 'aicode-consumers'
   return creds
 }
 
 /**
- * 清除本地保存的凭据
+ * Build the Google authorization URL for the consent screen.
+ *
+ * @param options - `{ state, clientId, clientSecret, redirectUri }`.
+ * @returns the absolute authorization URL.
  */
-export function clearCredentials() {
-  if (fs.existsSync(DSH_AUTH_JSON)) {
-    try { fs.unlinkSync(DSH_AUTH_JSON) } catch {}
-  }
-  if (fs.existsSync(OMP_AGENT_DB)) {
-    try {
-      const db = new DatabaseSync(OMP_AGENT_DB)
-      db.prepare("DELETE FROM auth_credentials WHERE provider = 'google-antigravity'").run()
-    } catch {}
+export function getAuthorizationUrl(options = {}) {
+  const { clientId } = resolveOAuthClient(options)
+  const params = new URLSearchParams({
+    client_id: clientId,
+    redirect_uri: options.redirectUri || DEFAULT_REDIRECT_URI,
+    response_type: 'code',
+    scope: OAUTH_SCOPES.join(' '),
+    access_type: 'offline',
+    prompt: 'consent'
+  })
+  if (options.state) params.set('state', options.state)
+  return `${AUTH_URL}?${params.toString()}`
+}
+
+/**
+ * Split a loopback redirect URI into the listener coordinates.
+ *
+ * @param redirectUri - the configured redirect URI.
+ * @returns `{ host, port, pathname }`.
+ */
+export function parseRedirectUri(redirectUri = DEFAULT_REDIRECT_URI) {
+  const url = new URL(redirectUri)
+  return {
+    host: url.hostname || '127.0.0.1',
+    port: Number(url.port) || (url.protocol === 'https:' ? 443 : 80),
+    pathname: url.pathname || DEFAULT_CALLBACK_PATH
   }
 }
