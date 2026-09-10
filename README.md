@@ -110,16 +110,23 @@ export DSH_ANTIGRAVITY_CLIENT_SECRET=...
 ## 架构
 
 ```
-src/
-├── index.js      Host 插件：自有 settings 命名空间、原生适配器注册、
+src/                      TypeScript 源码（NodeNext 风格，import 写 ./x.js）
+├── index.ts      Host 插件：自有 settings 命名空间、原生适配器注册、
 │                 authorization 登录 flow、/dsh-antigravity/auth/* 回环路由、可选代理
-├── client.js     浏览器半：settings.models.provider-card 卡片内登录 UI
-├── adapter.js    原生 LlmAdapter：请求构造 + SSE → DSH StreamChunk
-├── auth.js       OAuth 端点、客户端解析、凭据分层读写、刷新
-├── auth-flow.js  单次 OAuth 尝试的本地回调监听（Web / flow / CLI 共用）
-├── proxy.js      可选 OpenAI 兼容代理
-└── models.js     模型目录与 id/wireId 解析
+├── client.ts     浏览器半：settings.models.provider-card 卡片内登录 UI
+├── adapter.ts    原生 LlmAdapter：请求构造 + SSE → DSH StreamChunk
+├── auth.ts       OAuth 端点、客户端解析、凭据分层读写、刷新
+├── auth-flow.ts  单次 OAuth 尝试的本地回调监听（Web / flow / CLI 共用）
+├── proxy.ts      可选 OpenAI 兼容代理
+├── models.ts     模型目录与 id/wireId 解析
+└── bin.ts        独立 CLI（login / logout / status / refresh / proxy）
+lib/                      tsc 构建产物（git 忽略，随 npm 包发布）
 ```
+
+浏览器半（`client.ts` → `lib/client.js`）由 `tsconfig.client.json` 单独编译：DSH 对插件客户端代码
+是**原样下发、不做转译**，所以它必须以经典脚本形式产出，`window.__ModuleLoader__.load({...})`
+包装结构不能变成 ES module（因此该份配置显式声明 `moduleDetection: "legacy"`，否则 tsc 会追加
+`export {};`，在浏览器里直接是语法错误）。
 
 ### DSH 集成点
 
@@ -136,8 +143,13 @@ src/
 
 ```bash
 pnpm install
-node test/test.js          # 34 项单元测试，无网络、无真实凭据
+pnpm run build             # tsc → lib/（测试与发布均针对 lib/ 产物）
+pnpm test                  # 构建后跑 37 项单元测试，无网络、无真实凭据
+pnpm run test:types        # 仅类型检查（Host 半 + 浏览器半两份 tsconfig）
+pnpm pack                  # prepack 会自动 build，产物只含 lib/
 ```
+
+> 改了源码后必须重新构建：运行中的 DSH 与 `dsh list` 消费的是 `lib/` 而不是 `src/`。
 
 测试覆盖：模型解析、凭据记录封装、OAuth URL、请求构造、SSE 解析、用量映射、Cordis 注册（断言目录条目落在 `llm-antigravity` 而非 `llm-pi-ai`）、浏览器半插槽注册。
 

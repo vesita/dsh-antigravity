@@ -1,7 +1,7 @@
-window.__ModuleLoader__.load({
+(window as any).__ModuleLoader__.load({
   id: 'dsh-antigravity',
-  factory: require => {
-    var module = { exports: {} }
+  factory: (require: (id: string) => any) => {
+    var module = { exports: {} as any }
     var exports = module.exports
     Object.defineProperty(exports, Symbol.toStringTag, { value: 'Module' })
 
@@ -23,12 +23,42 @@ window.__ModuleLoader__.load({
      * children from `props.children` and treats its third argument as the key,
      * so calling it in `createElement` shape silently renders empty elements.
      */
+    /** Payload of the host's `/dsh-antigravity/auth/status` route. */
+    interface Status {
+      authenticated?: boolean
+      pending?: boolean
+      expired?: boolean
+      email?: string | null
+      projectId?: string | null
+      expires?: number | null
+      timeLeftSeconds?: number | null
+      loginUrl?: string | null
+      error?: string | null
+    }
+
+    /** Locale strings this card renders. */
+    interface Copy {
+      signedIn: string
+      signedOut: string
+      expired: string
+      signIn: string
+      signOut: string
+      cancel: string
+      waiting: string
+      reopen: string
+      project: string
+      expires: string
+      minutes: string
+      retry: string
+      failed: string
+    }
+
     const ROUTE = '/dsh-antigravity/auth'
     const PROVIDER = 'google-antigravity'
     const POLL_MS = 1500
 
     const zh = typeof navigator !== 'undefined' && /^zh/i.test(navigator.language || '')
-    const copy = zh
+    const copy: Copy = zh
       ? {
           signedIn: '已登录',
           signedOut: '未登录',
@@ -60,12 +90,12 @@ window.__ModuleLoader__.load({
           failed: 'Request failed'
         }
 
-    async function call(path, init) {
+    async function call(path: string, init?: RequestInit): Promise<any> {
       const response = await fetch(`${ROUTE}${path}`, {
         headers: { accept: 'application/json' },
         ...init
       })
-      let payload = {}
+      let payload: any = {}
       try {
         payload = await response.json()
       } catch {
@@ -86,7 +116,7 @@ window.__ModuleLoader__.load({
       link: { fontSize: '12px', lineHeight: '18px', color: 'var(--dsw-alias-brand-primary)' }
     }
 
-    function AntigravityCard(props) {
+    function AntigravityCard(props: any) {
       const provider = props && props.provider
       const [status, setStatus] = React.useState(null)
       const [busy, setBusy] = React.useState(false)
@@ -95,7 +125,7 @@ window.__ModuleLoader__.load({
 
       const refresh = React.useCallback(async () => {
         try {
-          const next = await call('/status')
+          const next: Status = await call('/status')
           setStatus(next)
           setAuthUrl(next.loginUrl || null)
           setError(null)
@@ -108,7 +138,7 @@ window.__ModuleLoader__.load({
         let alive = true
         ;(async () => {
           try {
-            const next = await call('/status')
+            const next: Status = await call('/status')
             if (!alive) return
             setStatus(next)
             setAuthUrl(next.loginUrl || null)
@@ -131,7 +161,7 @@ window.__ModuleLoader__.load({
       }, [status && status.pending, refresh])
 
       const run = React.useCallback(
-        async fn => {
+        async (fn: () => Promise<any>) => {
           setBusy(true)
           setError(null)
           try {
@@ -266,7 +296,7 @@ window.__ModuleLoader__.load({
 
     const inject = ['slots']
 
-    function apply(ctx) {
+    function apply(ctx: any) {
       ctx.slots.inject('settings.models.provider-card', () =>
         ctx.slots.register(
           {

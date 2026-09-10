@@ -1,6 +1,23 @@
 import { randomUUID } from 'node:crypto'
 import { LlmAdapter, LlmError } from '@deepseek-ai/dsh-llm'
+import type {
+  ContentBlock,
+  FinishReason,
+  GenerateOptions,
+  LlmModelInfo,
+  LlmProviderInfo,
+  LlmResolvedModelInfo,
+  Message,
+  ReasoningEffortId,
+  ResolvedRetryPolicy,
+  StreamChunk,
+  TokenUsage,
+  ToolCallBlock,
+  ToolResultBlock
+} from '@deepseek-ai/dsh-llm'
 import { MODEL_CATALOG, REASONING_EFFORTS, modelInfoOf, resolveModelSpec } from './models.js'
+import type { ModelSpec } from './models.js'
+import type { AntigravityCredentials } from './auth.js'
 
 /**
  * Native DSH `LlmAdapter` over the Antigravity `v1internal:streamGenerateContent`
@@ -22,55 +39,151 @@ export const DEFAULT_ENDPOINTS = [
   'https://cloudcode-pa.googleapis.com'
 ]
 
+/** One image resolved to inline request bytes. */
+export interface ResolvedImage {
+  mimeType: string
+  base64: string
+}
+
+/** Resolve one durable attachment reference into inline image bytes. */
+export type ImageResolver = (ref: unknown) => Promise<ResolvedImage | null>
+
+/** Every fact the adapter reads, supplied by the mounting plugin. */
+export interface AdapterOptions {
+  /** Active catalog, read fresh on every call so settings edits apply live. */
+  resolveModels?: () => ModelSpec[] | undefined
+  /** Credential facts for the provider route. */
+  resolveCredentials?: (signal?: AbortSignal) => Promise<AntigravityCredentials | undefined>
+  /** Configured endpoint, when settings name one. */
+  resolveEndpoint?: () => string | undefined
+  /** Configured billing project, when settings name one. */
+  resolveProjectId?: () => string | undefined
+  /** Default reasoning effort the caller left unset. */
+  resolveReasoningEffort?: () => ReasoningEffortId | undefined
+  /** Settings-owned retry policy. */
+  resolveRetryPolicy?: () => ResolvedRetryPolicy | undefined
+  /** Resolve one attachment reference into inline image bytes. */
+  resolveImage?: ImageResolver
+}
+
+/**
+ * Antigravity extension fields this adapter reads that DSH's core content
+ * vocabulary does not model: the replayed tool-call signature Antigravity
+ * requires, and the legacy `name` some tool-result producers attach beside the
+ * call id.
+ */
+type ProviderToolCallBlock = ToolCallBlock & { thoughtSignature?: string }
+type ProviderToolResultBlock = ToolResultBlock & { name?: string }
+
+/** A content block as the request builders read it: only its text projection matters. */
+type TextBearingBlock = ContentBlock & { text?: string }
+
+/** Model-facing content: DSH passes blocks, one-shot callers may pass a bare string. */
+type MessageContent = string | readonly TextBearingBlock[]
+
+/** One part of an Antigravity `GenerateContent` request. */
+interface AntigravityPart {
+  text?: string
+  functionCall?: { name?: string; args?: unknown; id?: string }
+  functionResponse?: { name: string; response: unknown; id?: string }
+  inlineData?: { mimeType: string; data: string }
+  thoughtSignature?: string
+}
+
+/** One role-tagged turn in an Antigravity `GenerateContent` request. */
+interface AntigravityContent {
+  role: string
+  parts: AntigravityPart[]
+}
+
+/** Gemini thinking controls this adapter emits. */
+interface ThinkingConfig {
+  includeThoughts: boolean
+  thinkingLevel?: string
+}
+
+/** Generation controls this adapter emits. */
+interface GenerationConfig {
+  thinkingConfig?: ThinkingConfig
+  temperature?: number
+  maxOutputTokens?: number
+  stopSequences?: string[]
+}
+
+/** The `request` field of an Antigravity payload. */
+interface AntigravityRequest {
+  contents: AntigravityContent[]
+  systemInstruction?: { parts: { text: string }[] }
+  tools?: { functionDeclarations: { name: string; description: string; parameters: Record<string, unknown> }[] }[]
+  generationConfig?: GenerationConfig
+}
+
+/** Gemini `usageMetadata` as the endpoint reports it. */
+interface GeminiUsageMetadata {
+  cachedContentTokenCount?: number
+  thoughtsTokenCount?: number
+  promptTokenCount?: number
+  candidatesTokenCount?: number
+  totalTokenCount?: number
+}
+
 export class GoogleAntigravityAdapter extends LlmAdapter {
+  /** Resolver functions installed by the mounting plugin. */
+  readonly options: AdapterOptions
+
   /**
    * @param options - `{ resolveModels, resolveCredentials, resolveEndpoint, resolveProjectId, resolveReasoningEffort, resolveRetryPolicy, resolveImage }`.
    */
-  constructor(options = {}) {
+  constructor(options: AdapterOptions = {}) {
     super()
     this.options = options
   }
 
   /** The active catalog, read fresh on every call so settings edits apply live. */
-  #catalog() {
+  #catalog(): ModelSpec[] {
     const models = this.options.resolveModels?.()
     return Array.isArray(models) && models.length > 0 ? models : MODEL_CATALOG
   }
 
-  providerInfo(provider) {
+  providerInfo(provider: string): LlmProviderInfo {
     return { id: provider, name: 'Google Antigravity' }
   }
 
-  providerRetryPolicy() {
-    return this.options.resolveRetryPolicy?.() ?? { mode: 'normal', maxRetries: 3 }
+  providerRetryPolicy(): ResolvedRetryPolicy | undefined {
+    // Settings own the fully resolved policy; this literal covers only the
+    // adapter's own cold start.
+    const fallback = { mode: 'normal', maxRetries: 3 } as ResolvedRetryPolicy
+    return this.options.resolveRetryPolicy?.() ?? fallback
   }
 
-  async listModels(provider) {
+  async listModels(provider: string): Promise<LlmModelInfo[]> {
     return this.#catalog().map(spec => modelInfoOf(spec, provider))
   }
 
-  async resolveModel(provider, modelId) {
-    const spec = resolveModelSpec(modelId, this.#catalog())
+  async resolveModel(provider: string, modelId: string): Promise<LlmResolvedModelInfo> {
+    // The runtime only asks about concrete, non-empty model ids, which always
+    // resolve against the catalog's permissive fallback.
+    const spec = resolveModelSpec(modelId, this.#catalog()) as ModelSpec
     return {
       provider,
       id: spec.id,
       name: spec.name || spec.id,
-      ...spec.description === undefined ? {} : { description: spec.description },
+      ...(spec.description === undefined ? {} : { description: spec.description }),
       context: { contextWindow: spec.contextWindow || 1048576 },
       defaultMaxTokens: spec.maxTokens || 65536,
       inputModalities: [...(spec.inputModalities || ['text'])],
-      ...spec.reasoning === false
+      ...(spec.reasoning === false
         ? {}
         : {
             reasoning: {
               efforts: REASONING_EFFORTS,
-              defaultEffort: this.options.resolveReasoningEffort?.() || 'high'
+              defaultEffort: this.options.resolveReasoningEffort?.() || ('high' as ReasoningEffortId)
             }
-          }
+          })
     }
   }
 
-  async *stream(options) {
+  async *stream(options: GenerateOptions): AsyncGenerator<StreamChunk, void, unknown> {
     const catalog = this.#catalog()
     const spec = resolveModelSpec(options.model, catalog)
     const wireModel = spec?.wireId || options.model
@@ -91,7 +204,7 @@ export class GoogleAntigravityAdapter extends LlmAdapter {
     yield* parseStream(response, spec)
   }
 
-  async #credentials(signal) {
+  async #credentials(signal?: AbortSignal): Promise<AntigravityCredentials> {
     try {
       const creds = await this.options.resolveCredentials?.(signal)
       if (!creds || !creds.access) throw new Error('no credentials')
@@ -105,7 +218,7 @@ export class GoogleAntigravityAdapter extends LlmAdapter {
     }
   }
 
-  #endpoints() {
+  #endpoints(): string[] {
     const configured = this.options.resolveEndpoint?.()
     if (typeof configured === 'string' && configured.length > 0) {
       return [configured, ...DEFAULT_ENDPOINTS.filter(endpoint => endpoint !== configured)]
@@ -113,8 +226,13 @@ export class GoogleAntigravityAdapter extends LlmAdapter {
     return DEFAULT_ENDPOINTS
   }
 
-  async #openStream(endpoints, accessToken, payload, signal) {
-    let lastError = null
+  async #openStream(
+    endpoints: string[],
+    accessToken: string,
+    payload: unknown,
+    signal?: AbortSignal
+  ): Promise<Response> {
+    let lastError: unknown = null
     for (const base of endpoints) {
       if (signal?.aborted) throw new LlmError('Antigravity 请求已被取消', 'ABORTED')
       const url = `${base.replace(/\/+$/, '')}/v1internal:streamGenerateContent?alt=sse`
@@ -146,7 +264,7 @@ export class GoogleAntigravityAdapter extends LlmAdapter {
   }
 }
 
-function httpCode(status) {
+function httpCode(status: number): string {
   if (status === 401 || status === 403) return 'INVALID_CREDENTIAL'
   if (status === 429) return 'QUOTA_EXCEEDED'
   if (status >= 500) return 'TRANSPORT'
@@ -165,12 +283,16 @@ function httpCode(status) {
  * @param resolveImage - optional `(ref) => Promise<{ mimeType, base64 } | null>`.
  * @returns the `request` field of the Antigravity payload.
  */
-export async function buildRequest(options, spec, resolveImage) {
+export async function buildRequest(
+  options: GenerateOptions,
+  spec: ModelSpec | null,
+  resolveImage?: ImageResolver
+): Promise<AntigravityRequest> {
   let systemText = typeof options.system === 'string' ? options.system : ''
   const toolNames = collectToolCallNames(options.messages || [])
-  const contents = []
+  const contents: AntigravityContent[] = []
 
-  const push = (role, parts) => {
+  const push = (role: string, parts: AntigravityPart[]) => {
     if (parts.length === 0) return
     const last = contents[contents.length - 1]
     if (last && last.role === role) last.parts.push(...parts)
@@ -192,7 +314,7 @@ export async function buildRequest(options, spec, resolveImage) {
     push('user', await userParts(message, toolNames, resolveImage))
   }
 
-  const request = { contents }
+  const request: AntigravityRequest = { contents }
   if (systemText) request.systemInstruction = { parts: [{ text: systemText }] }
 
   if (Array.isArray(options.tools) && options.tools.length > 0) {
@@ -207,7 +329,7 @@ export async function buildRequest(options, spec, resolveImage) {
     ]
   }
 
-  const generationConfig = {}
+  const generationConfig: GenerationConfig = {}
   if (spec?.reasoning !== false) {
     generationConfig.thinkingConfig = { includeThoughts: true }
     const effort = options.reasoningEffort
@@ -227,8 +349,8 @@ export async function buildRequest(options, spec, resolveImage) {
 }
 
 /** Map every assistant tool-call id to its function name across the whole history. */
-function collectToolCallNames(messages) {
-  const names = new Map()
+function collectToolCallNames(messages: Message[]): Map<string, string> {
+  const names = new Map<string, string>()
   for (const message of messages) {
     if (message.role !== 'assistant' || !Array.isArray(message.content)) continue
     for (const block of message.content) {
@@ -238,8 +360,8 @@ function collectToolCallNames(messages) {
   return names
 }
 
-async function assistantParts(content, resolveImage) {
-  const parts = []
+async function assistantParts(content: MessageContent | null | undefined, resolveImage?: ImageResolver): Promise<AntigravityPart[]> {
+  const parts: AntigravityPart[] = []
   if (typeof content === 'string') {
     if (content) parts.push({ text: content })
     return parts
@@ -254,11 +376,11 @@ async function assistantParts(content, resolveImage) {
         functionCall: {
           name: block.name,
           args: parseArguments(block.arguments),
-          ...block.id ? { id: block.id } : {}
+          ...(block.id ? { id: block.id } : {})
         },
         // Antigravity requires a signature on replayed calls; this sentinel is
         // the documented escape hatch when the original one was not retained.
-        thoughtSignature: block.thoughtSignature || 'skip_thought_signature_validator'
+        thoughtSignature: (block as ProviderToolCallBlock).thoughtSignature || 'skip_thought_signature_validator'
       })
     }
     // `reasoning` blocks are model-private; they are not replayed.
@@ -266,8 +388,12 @@ async function assistantParts(content, resolveImage) {
   return parts
 }
 
-async function userParts(message, toolNames, resolveImage) {
-  const parts = []
+async function userParts(
+  message: Message,
+  toolNames: Map<string, string>,
+  resolveImage?: ImageResolver
+): Promise<AntigravityPart[]> {
+  const parts: AntigravityPart[] = []
   const content = message.content
   if (typeof content === 'string') {
     if (content) parts.push({ text: content })
@@ -282,14 +408,14 @@ async function userParts(message, toolNames, resolveImage) {
       const inline = await imagePart(block.attachment, resolveImage)
       if (inline) parts.push(inline)
     } else if (block.type === 'tool-result') {
-      const callId = block.toolCallId || message.source?.callId
-      const name = (callId && toolNames.get(callId)) || block.name || 'tool'
+      const callId = block.toolCallId || (message.source as { callId?: string })?.callId
+      const name = (callId && toolNames.get(callId)) || (block as ProviderToolResultBlock).name || 'tool'
       const output = resultText(block.content)
       parts.push({
         functionResponse: {
           name,
           response: block.isError ? { error: output } : { output },
-          ...callId ? { id: callId } : {}
+          ...(callId ? { id: callId } : {})
         }
       })
     }
@@ -297,7 +423,7 @@ async function userParts(message, toolNames, resolveImage) {
   return parts
 }
 
-async function imagePart(ref, resolveImage) {
+async function imagePart(ref: unknown, resolveImage?: ImageResolver): Promise<AntigravityPart | null> {
   if (!ref) return null
   if (resolveImage === undefined) return null
   try {
@@ -309,25 +435,25 @@ async function imagePart(ref, resolveImage) {
   }
 }
 
-function parseArguments(raw) {
+function parseArguments(raw: unknown): unknown {
   if (raw === undefined || raw === null || raw === '') return {}
   if (typeof raw === 'object') return raw
   try {
-    const parsed = JSON.parse(raw)
+    const parsed = JSON.parse(raw as string)
     return parsed && typeof parsed === 'object' ? parsed : {}
   } catch {
     return {}
   }
 }
 
-function resultText(content) {
+function resultText(content: MessageContent | null | undefined): string {
   if (typeof content === 'string') return content
   if (Array.isArray(content)) return content.map(part => part?.text || '').join('\n')
   if (content === undefined || content === null) return ''
   return JSON.stringify(content)
 }
 
-function textOf(content) {
+function textOf(content: MessageContent | null | undefined): string {
   if (typeof content === 'string') return content
   if (Array.isArray(content)) return content.map(part => part?.text || '').join('\n')
   return ''
@@ -343,19 +469,25 @@ function textOf(content) {
  * @param response - the `fetch` response whose body is `text/event-stream`.
  * @param spec - the resolved catalog entry, used only for capacity defaults.
  */
-export async function* parseStream(response, spec) {
+export async function* parseStream(
+  response: Response,
+  spec: ModelSpec | null
+): AsyncGenerator<StreamChunk, void, unknown> {
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
   let buffer = ''
   let blockIndex = 0
-  let active = null // { type: 'text'|'reasoning', text: string }
-  let finishReason = 'stop'
-  let usage = null
+  let active: { type: 'text' | 'reasoning'; text: string } | null = null
+  let finishReason: 'stop' | 'max-tokens' = 'stop'
+  let usage: TokenUsage | null = null
   let sawToolCall = false
 
-  const endActive = () => {
+  const endActive = (): StreamChunk | null => {
     if (active === null) return null
-    const chunk = { type: 'block-end', index: blockIndex++, block: { type: active.type, text: active.text } }
+    // The block type is a member of the same union DSH models; the assertion
+    // only narrows the `text`/`reasoning` pair this adapter actually emits.
+    const block = { type: active.type, text: active.text } as ContentBlock
+    const chunk: StreamChunk = { type: 'block-end', index: blockIndex++, block }
     active = null
     return chunk
   }
@@ -375,7 +507,7 @@ export async function* parseStream(response, spec) {
         const raw = trimmed.slice(5).trim()
         if (!raw || raw === '[DONE]') continue
 
-        let event
+        let event: any
         try {
           event = JSON.parse(raw)
         } catch {
@@ -433,7 +565,7 @@ export async function* parseStream(response, spec) {
   // A completed tool call must run even when the same turn also hit the output
   // cap, so tool-calls outranks max-tokens.
   const kind = sawToolCall ? 'tool-calls' : finishReason
-  yield { type: 'finish', reason: { kind } }
+  yield { type: 'finish', reason: { kind } as FinishReason }
 }
 
 /**
@@ -445,7 +577,7 @@ export async function* parseStream(response, spec) {
  * @param metadata - Gemini usage metadata.
  * @returns a `TokenUsage`.
  */
-export function mapUsage(metadata) {
+export function mapUsage(metadata: GeminiUsageMetadata): TokenUsage {
   const cached = metadata.cachedContentTokenCount || 0
   const thoughts = metadata.thoughtsTokenCount || 0
   const prompt = metadata.promptTokenCount || 0
@@ -455,8 +587,8 @@ export function mapUsage(metadata) {
   return {
     inputTokens,
     outputTokens,
-    ...cached > 0 ? { cacheReadTokens: cached } : {},
-    ...thoughts > 0 ? { reasoningTokens: thoughts } : {},
+    ...(cached > 0 ? { cacheReadTokens: cached } : {}),
+    ...(thoughts > 0 ? { reasoningTokens: thoughts } : {}),
     totalTokens: metadata.totalTokenCount || inputTokens + cached + outputTokens
   }
 }

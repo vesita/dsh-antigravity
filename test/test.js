@@ -1,7 +1,7 @@
 import assert from 'node:assert'
 import { Context } from '@deepseek-ai/cordis'
 import { LlmRuntime } from '@deepseek-ai/dsh-llm'
-import { buildRequest, mapUsage, parseStream } from '../src/adapter.js'
+import { buildRequest, mapUsage, parseStream } from '../lib/adapter.js'
 import {
   CREDENTIAL_KEY,
   fromGrantRecord,
@@ -10,9 +10,9 @@ import {
   parseRedirectUri,
   resolveOAuthClient,
   toGrantRecord
-} from '../src/auth.js'
-import { MODEL_CATALOG, resolveModelSpec } from '../src/models.js'
-import antigravityPlugin from '../src/index.js'
+} from '../lib/auth.js'
+import { MODEL_CATALOG, resolveModelSpec } from '../lib/models.js'
+import antigravityPlugin from '../lib/index.js'
 
 let passed = 0
 async function check(label, fn) {
@@ -232,7 +232,7 @@ const { fileURLToPath } = await import('node:url')
 const { dirname, join } = await import('node:path')
 const vm = await import('node:vm')
 
-const clientSource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'src', 'client.js'), 'utf8')
+const clientSource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'lib', 'client.js'), 'utf8')
 let registration = null
 const sandbox = {
   window: {

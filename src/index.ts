@@ -1,6 +1,9 @@
 import z from '@deepseek-ai/schemastery'
 import { RetryPolicySchema } from '@deepseek-ai/dsh-llm'
+import type { ReasoningEffortId, ResolvedRetryPolicy } from '@deepseek-ai/dsh-llm'
+import type { IncomingMessage, Server, ServerResponse } from 'node:http'
 import { GoogleAntigravityAdapter } from './adapter.js'
+import type { ResolvedImage } from './adapter.js'
 import { LoginManager } from './auth-flow.js'
 import {
   CREDENTIAL_KEY,
@@ -10,7 +13,9 @@ import {
   saveCredentials,
   writeCredentialRecord
 } from './auth.js'
+import type { AntigravityCredentials, CredentialsSeam } from './auth.js'
 import { MODEL_CATALOG, MODEL_MODALITIES, REASONING_EFFORTS } from './models.js'
+import type { ModelSpec } from './models.js'
 import { createProxyServer } from './proxy.js'
 
 /**
@@ -37,6 +42,44 @@ const NS = 'llm-antigravity'
 const PROVIDER = 'google-antigravity'
 /** Loopback route prefix for the browser half. */
 const ROUTE_PREFIX = '/dsh-antigravity/auth'
+
+/**
+ * The resolved `llm-antigravity` settings section, as the settings service
+ * hands it back after schema defaulting.
+ */
+interface AntigravitySettings {
+  models?: ModelSpec[]
+  endpoint?: string
+  projectId?: string
+  clientId?: string
+  clientSecret?: string
+  redirectUri?: string
+  reasoningEffort?: ReasoningEffortId
+  retryPolicy?: ResolvedRetryPolicy
+  proxy?: {
+    enabled?: boolean
+    host?: string
+    port?: number
+  }
+}
+
+/** Attachment reference as the image resolver reads it. */
+interface ImageRef {
+  mediaType?: string
+}
+
+/** Shape of the `/status` payload the browser half consumes. */
+interface StatusPayload {
+  authenticated: boolean
+  email?: string | null
+  projectId?: string | null
+  expires?: number | null
+  timeLeftSeconds?: number | null
+  pending?: boolean
+  loginUrl?: string | null
+  error?: string | null
+  expired?: boolean
+}
 
 const modelSchema = z.object({
   id: z.string().required(),
@@ -67,26 +110,31 @@ export const Config = z.object({
     .default({ enabled: false, host: '127.0.0.1', port: 8045 })
 })
 
-export function apply(ctx, config = {}) {
-  let current = () => config
-  let proxyServer = null
-  let proxyKey = null
+/**
+ * The Cordis context stays structurally open here: the routes this plugin
+ * consumes (`credentials`, `attachments`, `connection`, `webServer`, `settings`,
+ * `authorization`) are all optional seams resolved through `ctx.get`/`ctx.inject`.
+ */
+export function apply(ctx: any, config: AntigravitySettings = {}): void {
+  let current: () => AntigravitySettings = () => config
+  let proxyServer: Server | null = null
+  let proxyKey: string | null = null
 
-  const catalog = () => {
+  const catalog = (): ModelSpec[] => {
     const models = current().models
     return Array.isArray(models) && models.length > 0 ? models : MODEL_CATALOG
   }
-  const credentialsService = () => ctx.get('credentials')
+  const credentialsService = (): CredentialsSeam | undefined => ctx.get('credentials')
   const oauthOptions = () => ({
     clientId: current().clientId,
     clientSecret: current().clientSecret,
     redirectUri: current().redirectUri
   })
 
-  const resolveCredentials = signal =>
+  const resolveCredentials = (signal?: AbortSignal): Promise<AntigravityCredentials> =>
     getValidCredentials(credentialsService(), { ...oauthOptions(), signal })
 
-  const resolveImage = async (ref, signal) => {
+  const resolveImage = async (ref: ImageRef, signal?: AbortSignal): Promise<ResolvedImage | null> => {
     const attachments = ctx.get('attachments')
     if (attachments === undefined) return null
     const stored = await attachments.readImage(ref, signal)
@@ -101,7 +149,7 @@ export function apply(ctx, config = {}) {
   // -------------------------------------------------------------------------
   const login = new LoginManager({
     ...oauthOptions(),
-    onSuccess: async creds => {
+    onSuccess: async (creds: AntigravityCredentials) => {
       await saveCredentials(credentialsService(), creds)
     }
   })
@@ -134,7 +182,7 @@ export function apply(ctx, config = {}) {
   // -------------------------------------------------------------------------
   // Optional OpenAI-compatible proxy
   // -------------------------------------------------------------------------
-  const reconcileProxy = () => {
+  const reconcileProxy = (): void => {
     const proxy = current().proxy
     const enabled = proxy?.enabled === true
     const key = enabled ? `${proxy.host}:${proxy.port}` : null
@@ -179,7 +227,7 @@ export function apply(ctx, config = {}) {
   // -------------------------------------------------------------------------
   ctx.inject(['settings'], settingsCtx => {
     settingsCtx.settings.installSection(ctx, NS, Config, config, {
-      setSource: source => {
+      setSource: (source: () => AntigravitySettings) => {
         current = source
         login.configure(oauthOptions())
       },
@@ -187,7 +235,7 @@ export function apply(ctx, config = {}) {
         login.configure(oauthOptions())
         reconcileProxy()
       },
-      validate: value => {
+      validate: (value: AntigravitySettings) => {
         if (!Array.isArray(value.models) || value.models.length === 0) {
           throw new Error('llm-antigravity: models 不能为空；至少保留一个模型')
         }
@@ -220,7 +268,7 @@ export function apply(ctx, config = {}) {
   // Loopback routes for the browser half
   // -------------------------------------------------------------------------
   ctx.inject(['webServer'], webCtx => {
-    const guard = (req, res) => {
+    const guard = (req: IncomingMessage, res: ServerResponse): boolean => {
       const connection = ctx.get('connection')
       if (connection === undefined) return false
       const rejection = connection.requestRejection(req)
@@ -230,7 +278,7 @@ export function apply(ctx, config = {}) {
       return true
     }
 
-    const status = async () => {
+    const status = async (): Promise<StatusPayload> => {
       const snapshot = login.status()
       try {
         // Resolve (and refresh, when possible) so the card never claims a live
@@ -247,7 +295,7 @@ export function apply(ctx, config = {}) {
           error: null
         }
       } catch (error) {
-        let stored = null
+        let stored: AntigravityCredentials | null = null
         try {
           stored = await loadCredentials(credentialsService())
         } catch {
@@ -270,7 +318,7 @@ export function apply(ctx, config = {}) {
         webCtx.webServer.register({
           kind: 'exact',
           path: `${ROUTE_PREFIX}/status`,
-          handler: async (req, res) => {
+          handler: async (req: IncomingMessage, res: ServerResponse) => {
             if (guard(req, res)) return
             if (req.method !== 'GET') return methodNotAllowed(res, 'GET')
             sendJson(res, 200, await status())
@@ -284,7 +332,7 @@ export function apply(ctx, config = {}) {
         webCtx.webServer.register({
           kind: 'exact',
           path: `${ROUTE_PREFIX}/login`,
-          handler: async (req, res) => {
+          handler: async (req: IncomingMessage, res: ServerResponse) => {
             if (guard(req, res)) return
             if (req.method !== 'POST') return methodNotAllowed(res, 'POST')
             try {
@@ -303,7 +351,7 @@ export function apply(ctx, config = {}) {
         webCtx.webServer.register({
           kind: 'exact',
           path: `${ROUTE_PREFIX}/cancel`,
-          handler: (req, res) => {
+          handler: (req: IncomingMessage, res: ServerResponse) => {
             if (guard(req, res)) return
             if (req.method !== 'POST') return methodNotAllowed(res, 'POST')
             login.cancel()
@@ -318,7 +366,7 @@ export function apply(ctx, config = {}) {
         webCtx.webServer.register({
           kind: 'exact',
           path: `${ROUTE_PREFIX}/logout`,
-          handler: async (req, res) => {
+          handler: async (req: IncomingMessage, res: ServerResponse) => {
             if (guard(req, res)) return
             if (req.method !== 'POST') return methodNotAllowed(res, 'POST')
             login.cancel()
@@ -348,7 +396,7 @@ export function apply(ctx, config = {}) {
   }, 'dsh-antigravity: registration teardown')
 }
 
-function sendJson(res, statusCode, payload) {
+function sendJson(res: ServerResponse, statusCode: number, payload: unknown): void {
   if (res.headersSent) return
   const body = JSON.stringify(payload)
   res.writeHead(statusCode, {
@@ -358,7 +406,7 @@ function sendJson(res, statusCode, payload) {
   res.end(body)
 }
 
-function methodNotAllowed(res, allowed) {
+function methodNotAllowed(res: ServerResponse, allowed: string): void {
   res.setHeader('Allow', allowed)
   sendJson(res, 405, { error: `仅支持 ${allowed}` })
 }

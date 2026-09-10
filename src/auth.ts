@@ -20,6 +20,75 @@ const TOKEN_URL = 'https://oauth2.googleapis.com/token'
 const USERINFO_URL = 'https://www.googleapis.com/oauth2/v1/userinfo?alt=json'
 const LOAD_CODE_ASSIST_URL = 'https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist'
 
+/**
+ * Credential facts this plugin stores and resolves.
+ *
+ * The record seam persists them verbatim, so every field stays optional except
+ * the bearer token the provider boundary actually requires.
+ */
+export interface AntigravityCredentials {
+  /** Bearer access token used at the Antigravity endpoint. */
+  access: string
+  /** Long-lived refresh token, when Google returned one. */
+  refresh?: string
+  /** Absolute access-token expiry, epoch milliseconds. */
+  expires?: number
+  /** Google account email, when known. */
+  email?: string
+  /** Cloud project the requests bill against. */
+  projectId?: string
+  /** When the grant was established, epoch milliseconds. */
+  authorizedAt?: number
+  /** Which credential layer produced these facts. */
+  source?: string
+}
+
+/** Minimal structural view of the `ctx.credentials` record seam. */
+export interface CredentialsSeam {
+  readRecord(key: string): Promise<unknown>
+  modifyRecord(key: string, update: () => Promise<unknown>): Promise<unknown>
+  deleteRecord(key: string): Promise<unknown>
+}
+
+/** The verbatim grant envelope this plugin writes into the record seam. */
+export interface GrantRecord {
+  kind: string
+  payload?: unknown
+}
+
+/** OAuth client facts a caller (settings, CLI) may override. */
+export interface OAuthClientOverrides {
+  clientId?: string
+  clientSecret?: string
+}
+
+/** OAuth client facts plus the loopback redirect a request targets. */
+export interface OAuthRequestOptions extends OAuthClientOverrides {
+  redirectUri?: string
+  signal?: AbortSignal
+}
+
+/** Refresh controls on top of the OAuth client facts. */
+export interface RefreshOptions extends OAuthClientOverrides {
+  signal?: AbortSignal
+  attempts?: number
+}
+
+/** `fetch` JSON payloads this module reads. */
+interface TokenResponse {
+  access_token?: string
+  refresh_token?: string
+  expires_in?: number
+}
+
+interface UserInfoResponse {
+  email?: string
+}
+
+interface LoadCodeAssistResponse {
+  cloudaicompanionProject?: string
+}
+
 /** OAuth scopes the Antigravity client requests. */
 export const OAUTH_SCOPES = [
   'https://www.googleapis.com/auth/cloud-platform',
@@ -37,12 +106,12 @@ export const DEFAULT_CALLBACK_PORT = 51121
 export const DEFAULT_CALLBACK_PATH = '/oauth-callback'
 
 /** DSH home directory, honoring `DSH_HOME`. */
-export function dshHome() {
+export function dshHome(): string {
   return process.env.DSH_HOME || path.join(os.homedir(), '.dsh')
 }
 
 /** Standalone credential mirror owned by this plugin. */
-export function authFilePath() {
+export function authFilePath(): string {
   return path.join(dshHome(), 'antigravity-auth.json')
 }
 
@@ -74,7 +143,7 @@ const BUILTIN_CLIENT_SECRET = Buffer.from(
  * @param overrides - `{ clientId, clientSecret }` from settings, when present.
  * @returns the client id and secret.
  */
-export function resolveOAuthClient(overrides = {}) {
+export function resolveOAuthClient(overrides: OAuthClientOverrides = {}): { clientId: string; clientSecret: string } {
   const clientId =
     nonEmpty(overrides.clientId) ||
     nonEmpty(process.env.DSH_ANTIGRAVITY_CLIENT_ID) ||
@@ -90,7 +159,7 @@ export function resolveOAuthClient(overrides = {}) {
   return { clientId, clientSecret }
 }
 
-function nonEmpty(value) {
+function nonEmpty(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined
 }
 
@@ -99,21 +168,22 @@ function nonEmpty(value) {
 // ---------------------------------------------------------------------------
 
 /** Wrap raw credential facts as the grant record the seam stores verbatim. */
-export function toGrantRecord(creds) {
+export function toGrantRecord(creds: AntigravityCredentials): GrantRecord {
   return { kind: 'grant', payload: creds }
 }
 
 /** Read the raw credential facts out of a stored grant record, if it is ours. */
-export function fromGrantRecord(record) {
+export function fromGrantRecord(record: unknown): AntigravityCredentials | null {
   if (record === undefined || record === null) return null
-  if (record.kind !== 'grant') return null
-  const payload = record.payload
+  const candidate = record as GrantRecord
+  if (candidate.kind !== 'grant') return null
+  const payload = candidate.payload
   if (payload === undefined || payload === null || typeof payload !== 'object') return null
-  return payload
+  return payload as AntigravityCredentials
 }
 
 /** Read this plugin's credential record; `null` when absent or foreign. */
-export async function readCredentialRecord(credentials) {
+export async function readCredentialRecord(credentials?: CredentialsSeam | null): Promise<AntigravityCredentials | null> {
   if (credentials === undefined || credentials === null) return null
   try {
     return fromGrantRecord(await credentials.readRecord(CREDENTIAL_KEY))
@@ -123,13 +193,16 @@ export async function readCredentialRecord(credentials) {
 }
 
 /** Commit this plugin's credential record. */
-export async function writeCredentialRecord(credentials, creds) {
+export async function writeCredentialRecord(
+  credentials: CredentialsSeam | undefined | null,
+  creds: AntigravityCredentials
+): Promise<void> {
   if (credentials === undefined || credentials === null) return
   await credentials.modifyRecord(CREDENTIAL_KEY, async () => toGrantRecord(creds))
 }
 
 /** Delete this plugin's credential record, ignoring absence. */
-export async function deleteCredentialRecord(credentials) {
+export async function deleteCredentialRecord(credentials?: CredentialsSeam | null): Promise<void> {
   if (credentials === undefined || credentials === null) return
   try {
     await credentials.deleteRecord(CREDENTIAL_KEY)
@@ -143,11 +216,11 @@ export async function deleteCredentialRecord(credentials) {
 // ---------------------------------------------------------------------------
 
 /** Read the private credential mirror, or `null` when absent/unreadable. */
-export function readAuthFile() {
+export function readAuthFile(): AntigravityCredentials | null {
   const file = authFilePath()
   if (!fs.existsSync(file)) return null
   try {
-    const data = JSON.parse(fs.readFileSync(file, 'utf8'))
+    const data = JSON.parse(fs.readFileSync(file, 'utf8')) as AntigravityCredentials | null
     return data && typeof data === 'object' && data.access ? data : null
   } catch {
     return null
@@ -155,7 +228,7 @@ export function readAuthFile() {
 }
 
 /** Write the private credential mirror with owner-only permissions. */
-export function writeAuthFile(creds) {
+export function writeAuthFile(creds: AntigravityCredentials): void {
   const file = authFilePath()
   fs.mkdirSync(path.dirname(file), { recursive: true })
   fs.writeFileSync(file, JSON.stringify(creds, null, 2), { mode: 0o600 })
@@ -167,7 +240,7 @@ export function writeAuthFile(creds) {
 }
 
 /** Remove the private credential mirror. */
-export function removeAuthFile() {
+export function removeAuthFile(): void {
   const file = authFilePath()
   try {
     if (fs.existsSync(file)) fs.unlinkSync(file)
@@ -189,7 +262,7 @@ export function removeAuthFile() {
  * @param credentials - optional `ctx.credentials` service.
  * @returns credential facts, or `null` when the route is not signed in.
  */
-export async function loadCredentials(credentials) {
+export async function loadCredentials(credentials?: CredentialsSeam | null): Promise<AntigravityCredentials | null> {
   const fromEnv = loadEnvCredentials()
   if (fromEnv) return fromEnv
 
@@ -207,7 +280,10 @@ export async function loadCredentials(credentials) {
  * @param credentials - optional `ctx.credentials` service.
  * @param creds - credential facts to persist.
  */
-export async function saveCredentials(credentials, creds) {
+export async function saveCredentials(
+  credentials: CredentialsSeam | undefined | null,
+  creds: AntigravityCredentials
+): Promise<void> {
   if (credentials !== undefined && credentials !== null) {
     try {
       await writeCredentialRecord(credentials, creds)
@@ -219,16 +295,16 @@ export async function saveCredentials(credentials, creds) {
 }
 
 /** Remove credentials from every store this plugin owns. */
-export async function clearCredentials(credentials) {
+export async function clearCredentials(credentials?: CredentialsSeam | null): Promise<void> {
   await deleteCredentialRecord(credentials)
   removeAuthFile()
 }
 
-function loadEnvCredentials() {
+function loadEnvCredentials(): AntigravityCredentials | null {
   const raw = nonEmpty(process.env.GOOGLE_ANTIGRAVITY_DATA)
   if (raw) {
     try {
-      const parsed = JSON.parse(raw)
+      const parsed = JSON.parse(raw) as AntigravityCredentials | null
       if (parsed && parsed.access) return parsed
     } catch {
       /* malformed JSON is ignored in favor of the next layer */
@@ -251,7 +327,7 @@ function loadEnvCredentials() {
 // ---------------------------------------------------------------------------
 
 /** Whether the access token is missing, expired, or within `skewMs` of expiry. */
-export function isExpiring(creds, skewMs = 60_000) {
+export function isExpiring(creds: AntigravityCredentials | null | undefined, skewMs = 60_000): boolean {
   if (!creds || !creds.access) return true
   if (typeof creds.expires !== 'number' || !Number.isFinite(creds.expires)) return false
   return Date.now() >= creds.expires - skewMs
@@ -264,7 +340,10 @@ export function isExpiring(creds, skewMs = 60_000) {
  * @param options - `{ clientId, clientSecret, redirectUri }`.
  * @returns credential facts, including any discovered project id and email.
  */
-export async function exchangeCodeForTokens(code, options = {}) {
+export async function exchangeCodeForTokens(
+  code: string,
+  options: OAuthRequestOptions = {}
+): Promise<AntigravityCredentials> {
   const { clientId, clientSecret } = resolveOAuthClient(options)
   const redirectUri = options.redirectUri || DEFAULT_REDIRECT_URI
 
@@ -285,13 +364,13 @@ export async function exchangeCodeForTokens(code, options = {}) {
     throw new Error(`换取授权码失败 (${res.status}): ${await res.text()}`)
   }
 
-  const data = await res.json()
+  const data = (await res.json()) as TokenResponse
   if (!data.access_token) throw new Error('Google OAuth 未返回 access_token')
 
-  const creds = {
+  const creds: AntigravityCredentials = {
     access: data.access_token,
-    ...data.refresh_token === undefined ? {} : { refresh: data.refresh_token },
-    expires: Date.now() + Math.max(60, ((data.expires_in || 3600) - 300)) * 1000,
+    ...(data.refresh_token === undefined ? {} : { refresh: data.refresh_token }),
+    expires: Date.now() + Math.max(60, (data.expires_in || 3600) - 300) * 1000,
     authorizedAt: Date.now()
   }
 
@@ -303,18 +382,18 @@ export async function exchangeCodeForTokens(code, options = {}) {
   return creds
 }
 
-async function fetchUserEmail(accessToken, signal) {
+async function fetchUserEmail(accessToken: string, signal?: AbortSignal): Promise<string | undefined> {
   try {
     const res = await fetch(USERINFO_URL, { headers: { Authorization: `Bearer ${accessToken}` }, signal })
     if (!res.ok) return undefined
-    const data = await res.json()
+    const data = (await res.json()) as UserInfoResponse
     return typeof data.email === 'string' && data.email.length > 0 ? data.email : undefined
   } catch {
     return undefined
   }
 }
 
-async function discoverProjectId(accessToken, signal) {
+async function discoverProjectId(accessToken: string, signal?: AbortSignal): Promise<string | undefined> {
   try {
     const res = await fetch(LOAD_CODE_ASSIST_URL, {
       method: 'POST',
@@ -327,7 +406,7 @@ async function discoverProjectId(accessToken, signal) {
       signal
     })
     if (!res.ok) return undefined
-    const data = await res.json()
+    const data = (await res.json()) as LoadCodeAssistResponse
     return typeof data.cloudaicompanionProject === 'string' ? data.cloudaicompanionProject : undefined
   } catch {
     return undefined
@@ -342,14 +421,17 @@ async function discoverProjectId(accessToken, signal) {
  * @param options - `{ clientId, clientSecret, signal, attempts }`.
  * @returns the same object, mutated with a fresh access token and expiry.
  */
-export async function refreshAccessToken(creds, options = {}) {
+export async function refreshAccessToken(
+  creds: AntigravityCredentials,
+  options: RefreshOptions = {}
+): Promise<AntigravityCredentials> {
   if (!creds || !creds.refresh) {
     throw new Error('未提供可用的 google-antigravity refresh_token，请重新登录')
   }
   const { clientId, clientSecret } = resolveOAuthClient(options)
   const attempts = Number.isInteger(options.attempts) && options.attempts > 0 ? options.attempts : 3
 
-  let lastError = null
+  let lastError: unknown = null
   for (let attempt = 0; attempt < attempts; attempt++) {
     if (options.signal?.aborted) throw options.signal.reason
     try {
@@ -365,10 +447,10 @@ export async function refreshAccessToken(creds, options = {}) {
         signal: options.signal
       })
       if (res.ok) {
-        const data = await res.json()
+        const data = (await res.json()) as TokenResponse
         if (!data.access_token) throw new Error('刷新响应缺少 access_token')
         creds.access = data.access_token
-        creds.expires = Date.now() + Math.max(60, ((data.expires_in || 3600) - 300)) * 1000
+        creds.expires = Date.now() + Math.max(60, (data.expires_in || 3600) - 300) * 1000
         if (!creds.projectId) {
           creds.projectId = (await discoverProjectId(creds.access, options.signal)) || 'aicode-consumers'
         }
@@ -387,7 +469,7 @@ export async function refreshAccessToken(creds, options = {}) {
   throw lastError || new Error('刷新 Google OAuth 令牌失败')
 }
 
-function sleep(ms, signal) {
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       signal?.removeEventListener('abort', onAbort)
@@ -395,7 +477,7 @@ function sleep(ms, signal) {
     }, ms)
     const onAbort = () => {
       clearTimeout(timer)
-      reject(signal.reason)
+      reject(signal?.reason)
     }
     signal?.addEventListener('abort', onAbort, { once: true })
   })
@@ -410,7 +492,10 @@ function sleep(ms, signal) {
  * @returns credential facts.
  * @throws when no credential layer has anything to offer.
  */
-export async function getValidCredentials(credentials, options = {}) {
+export async function getValidCredentials(
+  credentials?: CredentialsSeam | null,
+  options: OAuthRequestOptions = {}
+): Promise<AntigravityCredentials> {
   const creds = await loadCredentials(credentials)
   if (!creds || !creds.access) {
     throw new Error(
@@ -434,7 +519,7 @@ export async function getValidCredentials(credentials, options = {}) {
  * @param options - `{ state, clientId, clientSecret, redirectUri }`.
  * @returns the absolute authorization URL.
  */
-export function getAuthorizationUrl(options = {}) {
+export function getAuthorizationUrl(options: OAuthRequestOptions & { state?: string } = {}): string {
   const { clientId } = resolveOAuthClient(options)
   const params = new URLSearchParams({
     client_id: clientId,
@@ -454,7 +539,11 @@ export function getAuthorizationUrl(options = {}) {
  * @param redirectUri - the configured redirect URI.
  * @returns `{ host, port, pathname }`.
  */
-export function parseRedirectUri(redirectUri = DEFAULT_REDIRECT_URI) {
+export function parseRedirectUri(redirectUri: string = DEFAULT_REDIRECT_URI): {
+  host: string
+  port: number
+  pathname: string
+} {
   const url = new URL(redirectUri)
   return {
     host: url.hostname || '127.0.0.1',

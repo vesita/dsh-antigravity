@@ -1,7 +1,10 @@
 import http from 'node:http'
+import type { ServerResponse } from 'node:http'
 import { randomUUID } from 'node:crypto'
 import { DEFAULT_ENDPOINTS } from './adapter.js'
 import { MODEL_CATALOG, resolveModelSpec } from './models.js'
+import type { ModelSpec } from './models.js'
+import type { AntigravityCredentials } from './auth.js'
 
 /**
  * Optional OpenAI-compatible loopback proxy over the same Antigravity
@@ -21,13 +24,49 @@ const CORS_HEADERS = {
   'Access-Control-Allow-Headers': 'Content-Type, Authorization'
 }
 
+/** Every fact the proxy reads, supplied by the mounting plugin or the CLI. */
+export interface ProxyOptions {
+  /** Active catalog, read fresh on every request. */
+  resolveModels?: () => ModelSpec[] | undefined
+  /** Credential facts for the provider route. */
+  resolveCredentials?: (signal?: AbortSignal) => Promise<AntigravityCredentials | undefined>
+  /** Configured endpoint, when settings name one. */
+  resolveEndpoint?: () => string | undefined
+  /** Configured billing project, when settings name one. */
+  resolveProjectId?: () => string | undefined
+}
+
+/** One part of an Antigravity `GenerateContent` request built from an OpenAI body. */
+type ProxyPart = Record<string, unknown>
+
+/** One role-tagged turn in an Antigravity `GenerateContent` request. */
+interface ProxyContent {
+  role: string
+  parts: ProxyPart[]
+}
+
+/** The `request` field of an Antigravity payload. */
+interface ProxyRequest {
+  contents: ProxyContent[]
+  systemInstruction?: { parts: { text: string }[] }
+  tools?: { functionDeclarations: { name?: string; description: string; parameters: unknown }[] }[]
+  generationConfig?: Record<string, unknown>
+}
+
+/** Identity shared by every chunk of one completion. */
+interface CompletionMeta {
+  id: string
+  created: number
+  model: string
+}
+
 /**
  * Build the proxy HTTP server.
  *
  * @param options - `{ resolveModels, resolveCredentials, resolveEndpoint, resolveProjectId }`.
  * @returns a `node:http` server that is not yet listening.
  */
-export function createProxyServer(options = {}) {
+export function createProxyServer(options: ProxyOptions = {}): http.Server {
   const models = () => {
     const catalog = options.resolveModels?.()
     return Array.isArray(catalog) && catalog.length > 0 ? catalog : MODEL_CATALOG
@@ -46,7 +85,7 @@ export function createProxyServer(options = {}) {
       return
     }
 
-    let url
+    let url: URL
     try {
       url = new URL(req.url || '/', `http://${req.headers.host || '127.0.0.1'}`)
     } catch {
@@ -108,14 +147,20 @@ export function createProxyServer(options = {}) {
   return server
 }
 
-function sendJson(res, status, payload) {
+function sendJson(res: ServerResponse, status: number, payload: unknown): void {
   if (res.headersSent) return
   const body = JSON.stringify(payload)
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' })
   res.end(body)
 }
 
-async function handleChatCompletions(body, res, options, catalog, endpoints) {
+async function handleChatCompletions(
+  body: any,
+  res: ServerResponse,
+  options: ProxyOptions,
+  catalog: ModelSpec[],
+  endpoints: string[]
+): Promise<void> {
   const creds = await options.resolveCredentials?.()
   if (!creds || !creds.access) throw new Error('未登录 google-antigravity，请先在 DSH 中登录')
 
@@ -125,7 +170,7 @@ async function handleChatCompletions(body, res, options, catalog, endpoints) {
 
   const { contents, systemText, toolNames } = buildContents(body.messages || [])
 
-  const request = { contents }
+  const request: ProxyRequest = { contents }
   if (systemText) request.systemInstruction = { parts: [{ text: systemText }] }
 
   if (Array.isArray(body.tools) && body.tools.length > 0) {
@@ -140,7 +185,7 @@ async function handleChatCompletions(body, res, options, catalog, endpoints) {
     ]
   }
 
-  const generationConfig = {}
+  const generationConfig: Record<string, unknown> = {}
   if (spec?.reasoning !== false) generationConfig.thinkingConfig = { includeThoughts: true }
   if (body.temperature !== undefined) generationConfig.temperature = body.temperature
   if (body.max_tokens !== undefined) generationConfig.maxOutputTokens = body.max_tokens
@@ -155,8 +200,8 @@ async function handleChatCompletions(body, res, options, catalog, endpoints) {
     requestType: 'agent'
   }
 
-  let upstream = null
-  let lastError = null
+  let upstream: Response | null = null
+  let lastError: unknown = null
   for (const base of endpoints) {
     try {
       const response = await fetch(`${base.replace(/\/+$/, '')}/v1internal:streamGenerateContent?alt=sse`, {
@@ -187,10 +232,10 @@ async function handleChatCompletions(body, res, options, catalog, endpoints) {
   else await collectCompletion(upstream, res, { id, created, model: body.model, toolNames })
 }
 
-function buildContents(messages) {
+function buildContents(messages: any[]): { contents: ProxyContent[]; systemText: string; toolNames: Map<string, string> } {
   let systemText = ''
-  const contents = []
-  const toolNames = new Map()
+  const contents: ProxyContent[] = []
+  const toolNames = new Map<string, string>()
 
   for (const message of messages) {
     if (message.role === 'system') {
@@ -205,7 +250,7 @@ function buildContents(messages) {
     }
   }
 
-  const push = (role, parts) => {
+  const push = (role: string, parts: ProxyPart[]) => {
     if (parts.length === 0) return
     const last = contents[contents.length - 1]
     if (last && last.role === role) last.parts.push(...parts)
@@ -213,7 +258,7 @@ function buildContents(messages) {
   }
 
   for (const message of messages) {
-    const parts = []
+    const parts: ProxyPart[] = []
     if (typeof message.content === 'string') {
       if (message.content) parts.push({ text: message.content })
     } else if (Array.isArray(message.content)) {
@@ -232,7 +277,7 @@ function buildContents(messages) {
           functionResponse: {
             name: (message.tool_call_id && toolNames.get(message.tool_call_id)) || message.name || 'tool',
             response: { output: message.content ?? '' },
-            ...message.tool_call_id ? { id: message.tool_call_id } : {}
+            ...(message.tool_call_id ? { id: message.tool_call_id } : {})
           }
         }
       ])
@@ -257,7 +302,7 @@ function buildContents(messages) {
   return { contents, systemText, toolNames }
 }
 
-function safeJson(raw) {
+function safeJson(raw: unknown): unknown {
   if (typeof raw !== 'string' || raw.length === 0) return {}
   try {
     const parsed = JSON.parse(raw)
@@ -267,7 +312,7 @@ function safeJson(raw) {
   }
 }
 
-async function* sseEvents(upstream) {
+async function* sseEvents(upstream: Response): AsyncGenerator<any, void, unknown> {
   const reader = upstream.body.getReader()
   const decoder = new TextDecoder()
   let buffer = ''
@@ -295,7 +340,7 @@ async function* sseEvents(upstream) {
   }
 }
 
-async function streamCompletion(upstream, res, meta) {
+async function streamCompletion(upstream: Response, res: ServerResponse, meta: CompletionMeta): Promise<void> {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
@@ -367,10 +412,14 @@ async function streamCompletion(upstream, res, meta) {
   res.end()
 }
 
-async function collectCompletion(upstream, res, meta) {
+async function collectCompletion(
+  upstream: Response,
+  res: ServerResponse,
+  meta: CompletionMeta & { toolNames: Map<string, string> }
+): Promise<void> {
   let text = ''
   let reasoning = ''
-  const toolCalls = []
+  const toolCalls: unknown[] = []
   let finishReason = 'stop'
 
   for await (const event of sseEvents(upstream)) {
@@ -394,7 +443,10 @@ async function collectCompletion(upstream, res, meta) {
     }
   }
 
-  const message = { role: 'assistant', content: text }
+  const message: { role: string; content: string; reasoning_content?: string; tool_calls?: unknown[] } = {
+    role: 'assistant',
+    content: text
+  }
   if (reasoning) message.reasoning_content = reasoning
   if (toolCalls.length > 0) message.tool_calls = toolCalls
 

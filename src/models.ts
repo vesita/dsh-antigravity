@@ -1,3 +1,5 @@
+import type { LlmModelInfo, LlmReasoningEffortInfo, ModelModality, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+
 /**
  * Google Antigravity model catalog and request-side model resolution.
  *
@@ -9,12 +11,41 @@
  */
 
 /**
- * One catalog entry. `id` is the DSH-facing model id (what a Session selects
- * and what `settings.yaml` names); `wireId` is the Antigravity endpoint model
- * the request must carry. They differ because Antigravity exposes tiered
- * aliases (`gemini-3.8-flash-tiered`) behind friendlier selection ids.
+ * One fully populated catalog entry.
+ *
+ * `id` is the DSH-facing model id (what a Session selects and what
+ * `settings.yaml` names); `wireId` is the Antigravity endpoint model the
+ * request must carry. They differ because Antigravity exposes tiered aliases
+ * (`gemini-3.8-flash-tiered`) behind friendlier selection ids.
  */
-export const MODEL_CATALOG = [
+export interface ModelEntry {
+  /** DSH-facing selection id. */
+  id: string
+  /** Antigravity endpoint model id. */
+  wireId: string
+  /** Human-readable name for selectors. */
+  name: string
+  /** Optional user-facing distinction from otherwise similar models. */
+  description: string
+  /** Maximum combined request and response context in tokens. */
+  contextWindow: number
+  /** Maximum output tokens. */
+  maxTokens: number
+  /** Whether the model advertises selectable reasoning efforts. */
+  reasoning: boolean
+  /** Accepted request modalities. */
+  inputModalities: ModelModality[]
+}
+
+/**
+ * One catalog entry as consumers read it. A deployment may override any field
+ * through settings, so only the selection id is guaranteed to be present.
+ */
+export interface ModelSpec extends Partial<ModelEntry> {
+  id: string
+}
+
+export const MODEL_CATALOG: ModelEntry[] = [
   {
     id: 'gemini-3.8-flash',
     wireId: 'gemini-3.8-flash-tiered',
@@ -127,15 +158,21 @@ export const MODEL_CATALOG = [
   }
 ]
 
-/** The reasoning efforts every catalog model advertises, in display order. */
-export const REASONING_EFFORTS = [
-  { id: 'off', name: '关闭' },
-  { id: 'low', name: '低' },
-  { id: 'high', name: '高' }
+/**
+ * The reasoning efforts every catalog model advertises, in display order.
+ *
+ * The ids are plain strings at runtime; DSH models them as a compile-time
+ * `ReasoningEffortId` brand, so each one is asserted here instead of being
+ * built through a constructor call.
+ */
+export const REASONING_EFFORTS: readonly LlmReasoningEffortInfo[] = [
+  { id: 'off' as ReasoningEffortId, name: '关闭' },
+  { id: 'low' as ReasoningEffortId, name: '低' },
+  { id: 'high' as ReasoningEffortId, name: '高' }
 ]
 
 /** Accepted request modalities, mirroring `ModelModalityMap` from `@deepseek-ai/dsh-llm`. */
-export const MODEL_MODALITIES = ['text', 'image']
+export const MODEL_MODALITIES: readonly ModelModality[] = ['text', 'image']
 
 /** Fallback capacity for a model id the catalog does not describe. */
 export const DEFAULT_CONTEXT_WINDOW = 1048576
@@ -149,7 +186,7 @@ export const DEFAULT_MAX_TOKENS = 65536
  * @param catalog - the active catalog; defaults to {@link MODEL_CATALOG}.
  * @returns the matching entry, or a synthesized fallback carrying `modelId` as its wire id.
  */
-export function resolveModelSpec(modelId, catalog = MODEL_CATALOG) {
+export function resolveModelSpec(modelId: string | undefined, catalog: ModelSpec[] = MODEL_CATALOG): ModelSpec | null {
   if (!modelId) return null
   const cleaned = String(modelId).replace(/^google-antigravity\//, '')
 
@@ -164,7 +201,7 @@ export function resolveModelSpec(modelId, catalog = MODEL_CATALOG) {
   if (found) return found
 
   // 3. longest-prefix fallback (e.g. a dated suffix on a known family)
-  let best = null
+  let best: ModelSpec | null = null
   for (const m of entries) {
     if (!m.id || !cleaned.startsWith(m.id)) continue
     if (best === null || m.id.length > best.id.length) best = m
@@ -190,12 +227,12 @@ export function resolveModelSpec(modelId, catalog = MODEL_CATALOG) {
  * @param provider - the provider route key.
  * @returns detached `LlmModelInfo`-shaped metadata.
  */
-export function modelInfoOf(spec, provider) {
+export function modelInfoOf(spec: ModelSpec, provider: string): LlmModelInfo {
   return {
     provider,
     id: spec.id,
     name: spec.name || spec.id,
-    ...spec.description === undefined ? {} : { description: spec.description },
+    ...(spec.description === undefined ? {} : { description: spec.description }),
     inputModalities: [...(spec.inputModalities || MODEL_MODALITIES)]
   }
 }

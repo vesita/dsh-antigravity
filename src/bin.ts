@@ -6,10 +6,10 @@ import {
   readAuthFile,
   refreshAccessToken,
   saveCredentials
-} from './src/auth.js'
-import { LoginManager } from './src/auth-flow.js'
-import { MODEL_CATALOG } from './src/models.js'
-import { createProxyServer } from './src/proxy.js'
+} from './auth.js'
+import { LoginManager } from './auth-flow.js'
+import { MODEL_CATALOG } from './models.js'
+import { createProxyServer } from './proxy.js'
 
 /**
  * Standalone CLI. It runs without a Cordis context, so credentials come from
@@ -20,7 +20,7 @@ import { createProxyServer } from './src/proxy.js'
 const args = process.argv.slice(2)
 const command = args[0] || 'status'
 
-function flag(name, fallback) {
+function flag(name: string, fallback: string): string {
   const index = args.indexOf(`--${name}`)
   return index !== -1 && args[index + 1] !== undefined ? args[index + 1] : fallback
 }

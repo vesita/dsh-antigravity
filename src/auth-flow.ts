@@ -1,4 +1,5 @@
 import http from 'node:http'
+import type { IncomingMessage, ServerResponse } from 'node:http'
 import { randomBytes } from 'node:crypto'
 import {
   DEFAULT_REDIRECT_URI,
@@ -7,6 +8,7 @@ import {
   parseRedirectUri,
   resolveOAuthClient
 } from './auth.js'
+import type { AntigravityCredentials, OAuthClientOverrides } from './auth.js'
 
 /**
  * One browser-driven OAuth attempt, shared by the web settings UI, the
@@ -23,26 +25,61 @@ import {
 /** Attempt lifetime before the listener is abandoned. */
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000
 
+/** Facts a caller supplies when the manager is constructed or reconfigured. */
+export interface LoginManagerOptions extends OAuthClientOverrides {
+  /** Loopback redirect the consent screen returns to. */
+  redirectUri?: string
+  /** Attempt lifetime before the listener is abandoned. */
+  timeoutMs?: number
+  /** Progress notice emitted when the grant settles. */
+  onNotice?: (notice: { message: string; url?: string }) => void
+  /** Called with the credential facts once the exchange succeeds. */
+  onSuccess?: (creds: AntigravityCredentials) => void | Promise<void>
+  /** Optional logger owned by the mounting plugin. */
+  logger?: unknown
+}
+
+/** One attempt in flight: the consent URL plus the listener awaiting its code. */
+interface PendingLogin {
+  /** Google consent URL handed to the human. */
+  url: string
+  /** Anti-forgery value the callback must echo. */
+  state: string
+  /** Loopback listener awaiting the redirect. */
+  server: http.Server
+  /** Settles with the exchanged credentials once the code arrives. */
+  promise: Promise<AntigravityCredentials>
+  resolve: (creds: AntigravityCredentials) => void
+  reject: (error: Error) => void
+}
+
+/** Snapshot of the current attempt for a status read. */
+export interface LoginStatus {
+  pending: boolean
+  url: string | null
+  error: string | null
+}
+
 export class LoginManager {
-  #options
-  #pending = null
-  #lastError = null
+  #options: LoginManagerOptions
+  #pending: PendingLogin | null = null
+  #lastError: string | null = null
   #disposed = false
 
   /**
    * @param options - `{ clientId, clientSecret, redirectUri, timeoutMs, onNotice, onSuccess, logger }`.
    */
-  constructor(options = {}) {
+  constructor(options: LoginManagerOptions = {}) {
     this.#options = options
   }
 
   /** Update the OAuth client facts after a settings change. */
-  configure(options = {}) {
+  configure(options: LoginManagerOptions = {}): void {
     this.#options = { ...this.#options, ...options }
   }
 
   /** Snapshot the current attempt for a status read. */
-  status() {
+  status(): LoginStatus {
     return {
       pending: this.#pending !== null,
       url: this.#pending?.url ?? null,
@@ -55,7 +92,7 @@ export class LoginManager {
    *
    * @returns the Google consent URL the human must open.
    */
-  async begin() {
+  async begin(): Promise<string> {
     if (this.#disposed) throw new Error('登录管理器已销毁')
     if (this.#pending) return this.#pending.url
 
@@ -65,19 +102,19 @@ export class LoginManager {
     const { clientId, clientSecret } = resolveOAuthClient(this.#options)
     const url = getAuthorizationUrl({ clientId, clientSecret, redirectUri, state })
 
-    let settleResolve
-    let settleReject
-    const settled = new Promise((resolve, reject) => {
+    let settleResolve: (creds: AntigravityCredentials) => void
+    let settleReject: (error: Error) => void
+    const settled = new Promise<AntigravityCredentials>((resolve, reject) => {
       settleResolve = resolve
       settleReject = reject
     })
 
     const server = http.createServer()
-    const pending = { url, state, server, promise: settled, resolve: settleResolve, reject: settleReject }
+    const pending: PendingLogin = { url, state, server, promise: settled, resolve: settleResolve, reject: settleReject }
     this.#pending = pending
     this.#lastError = null
 
-    const finish = (error, creds) => {
+    const finish = (error: Error | null, creds?: AntigravityCredentials) => {
       if (this.#pending !== pending) return
       this.#pending = null
       if (timer !== undefined) clearTimeout(timer)
@@ -99,7 +136,7 @@ export class LoginManager {
     }, this.#options.timeoutMs || DEFAULT_TIMEOUT_MS)
     if (typeof timer.unref === 'function') timer.unref()
 
-    server.on('request', async (req, res) => {
+    server.on('request', async (req: IncomingMessage, res: ServerResponse) => {
       const requestUrl = new URL(req.url || '/', `http://${req.headers.host || `${host}:${port}`}`)
       if (requestUrl.pathname !== pathname) {
         res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' })
@@ -148,7 +185,7 @@ export class LoginManager {
       }
     })
 
-    server.on('error', (serverError) => {
+    server.on('error', (serverError: NodeJS.ErrnoException) => {
       const message =
         serverError.code === 'EADDRINUSE'
           ? `本地回调端口 ${port} 已被占用，请关闭占用该端口的程序后重试`
@@ -156,11 +193,11 @@ export class LoginManager {
       finish(new Error(message))
     })
 
-    await new Promise((resolve, reject) => {
+    await new Promise<void>((resolve, reject) => {
       server.once('listening', resolve)
       server.once('error', reject)
       server.listen(port, host)
-    }).catch((listenError) => {
+    }).catch((listenError: Error) => {
       finish(listenError)
       throw listenError
     })
@@ -173,12 +210,12 @@ export class LoginManager {
    *
    * @returns the credential facts, or `null` when no attempt is running.
    */
-  completion() {
+  completion(): Promise<AntigravityCredentials | null> {
     return this.#pending?.promise ?? Promise.resolve(null)
   }
 
   /** Abandon the attempt in flight, if any. */
-  cancel() {
+  cancel(): void {
     if (!this.#pending) return
     const pending = this.#pending
     this.#pending = null
@@ -191,13 +228,13 @@ export class LoginManager {
   }
 
   /** Permanently withdraw the manager. */
-  dispose() {
+  dispose(): void {
     this.#disposed = true
     this.cancel()
   }
 }
 
-function respond(res, status, title, body) {
+function respond(res: ServerResponse, status: number, title: string, body: string): void {
   res.writeHead(status, { 'Content-Type': 'text/html; charset=utf-8' })
   res.end(
     `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"/><title>${escapeHtml(title)}</title>` +
@@ -207,6 +244,6 @@ function respond(res, status, title, body) {
   )
 }
 
-function escapeHtml(value) {
+function escapeHtml(value: unknown): string {
   return String(value).replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch])
 }
