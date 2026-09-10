@@ -51,6 +51,11 @@ interface PendingLogin {
   promise: Promise<AntigravityCredentials>
   resolve: (creds: AntigravityCredentials) => void
   reject: (error: Error) => void
+  /**
+   * Ends this attempt through the single settle path: the loop's caller can
+   * abandon it without duplicating the timer, listener, and error bookkeeping.
+   */
+  settle: (error: Error | null, creds?: AntigravityCredentials) => void
 }
 
 /** Snapshot of the current attempt for a status read. */
@@ -109,8 +114,28 @@ export class LoginManager {
       settleReject = reject
     })
 
+    // The settings card never awaits `completion()`: it starts an attempt and
+    // polls `/status` instead, so on that path nobody observes a failed attempt.
+    // Node treats an unobserved rejection as fatal, and the DSH host installs a
+    // fail-loud `unhandledRejection` handler that exits the process — a
+    // cancelled, timed-out, or forged callback would therefore kill the running
+    // harness. Observing the promise here (a) keeps the reason reported through
+    // `status().error`, which is what both surfaces render, and (b) still
+    // rejects for whichever caller *is* awaiting the attempt.
+    settled.catch(() => {})
+
     const server = http.createServer()
-    const pending: PendingLogin = { url, state, server, promise: settled, resolve: settleResolve, reject: settleReject }
+    const pending: PendingLogin = {
+      url,
+      state,
+      server,
+      promise: settled,
+      resolve: settleResolve,
+      reject: settleReject,
+      // `finish` is defined below; the closure is only invoked once an attempt
+      // is under way, never during this construction.
+      settle: (error, creds) => finish(error, creds)
+    }
     this.#pending = pending
     this.#lastError = null
 
@@ -148,6 +173,15 @@ export class LoginManager {
       const code = requestUrl.searchParams.get('code')
       const returnedState = requestUrl.searchParams.get('state')
 
+      // Prove provenance before acting on anything. A callback that does not
+      // echo this attempt's state is not ours — a stale consent page left over
+      // from a cancelled attempt, or a stray request. It is refused without
+      // settling, so nothing outside this attempt can cancel the sign-in the
+      // human is completing; the attempt still ends by success or timeout.
+      if (returnedState !== state) {
+        respond(res, 400, '授权失败', 'state 校验失败，已忽略这次回调；DSH 仍在等待本次授权。')
+        return
+      }
       if (error) {
         respond(res, 400, '授权失败', `Google 返回错误：${error}。您可以关闭此标签页。`)
         finish(new Error(`授权失败：${error}`))
@@ -155,11 +189,6 @@ export class LoginManager {
       }
       if (!code) {
         respond(res, 400, '授权失败', '回调缺少授权码。您可以关闭此标签页。')
-        return
-      }
-      if (returnedState !== state) {
-        respond(res, 400, '授权失败', 'state 校验失败，请重新发起登录。')
-        finish(new Error('OAuth state 校验失败'))
         return
       }
 
@@ -216,15 +245,9 @@ export class LoginManager {
 
   /** Abandon the attempt in flight, if any. */
   cancel(): void {
-    if (!this.#pending) return
     const pending = this.#pending
-    this.#pending = null
-    try {
-      pending.server.close()
-    } catch {
-      /* already closed */
-    }
-    pending.reject(new Error('登录已取消'))
+    if (pending === null) return
+    pending.settle(new Error('登录已取消'))
   }
 
   /** Permanently withdraw the manager. */

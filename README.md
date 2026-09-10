@@ -22,21 +22,34 @@ DeepSeek Harness (DSH) 的 **Google Antigravity** 模型提供商插件：原生
 
 插件随 profile bundle 加载，无需额外配置即可在模型选择器中出现 `google-antigravity`。
 
-### 登录
+### 账户闭环：没有账户 → 添加 → 登录 → 移除
 
-1. 打开 **设置 → 模型**；
-2. 找到 **Google Antigravity** 卡片；
-3. 点击 **登录 Google 账号**，浏览器打开 Google 授权页；
-4. 授权后回到 DSH，卡片显示账号与项目 ID。
+Antigravity 的账户就是它的凭据，所以这三步都在**同一个地方**完成：**设置 → 模型** 里 **Google Antigravity** 那一行内的卡片。它不会出现在「添加提供方」下拉里 —— 那个下拉只列 `configured === false` 的条目，而本插件的目录条目 `settingsPath` 为空，`configured` 恒为真；换句话说，能在行里看到它，就注定它不在下拉里（两者互斥，`deepseek-official` 同理）。
 
-也可以在终端登录：
+| 卡片状态 | 显示 | 可用的操作 |
+| --- | --- | --- |
+| 没有账户 | 红点 + 未登录 | **登录 Google 账号** |
+| 等待授权 | 黄点 + 等待浏览器完成授权… | **重新打开授权页** / **取消** |
+| 凭据过期 | 红点 + 登录已过期，请重新登录 | **登录 Google 账号** |
+| 已登录 | 绿点 + 已登录 · 项目 · 令牌有效期 | **退出登录** |
+
+1. **添加 + 登录**：点 **登录 Google 账号**。宿主在 `http://127.0.0.1:51121/oauth-callback` 起一个回环监听并打开 Google 授权页；授权后浏览器重定向回该回环地址，凭据写入下面「凭据存放位置」的两处。卡片在等待期间每 1.5 秒轮询一次 `/status`，成功后自动变为已登录。
+2. **移除**：点 **退出登录**。它会先取消进行中的授权，再清空凭据记录与镜像文件，卡片回到「未登录」。行右上角的 **移除** 按钮不会出现 —— 那个按钮只删除能写进 settings 的 profile，删不掉 OAuth 凭据。
+3. **取消**：等待授权时点 **取消**（或关掉授权页直到 10 分钟超时）会结束本次尝试；卡片会把你送回「未登录」，并在下方说明原因。
+
+同一个插件只维护一份账户：凭据 key 固定为 `dsh-antigravity/google-antigravity`，再次登录是**覆盖**而不是新增。
+
+也可以在终端走同样的闭环（插件装在 profile 内，所以可执行文件也在 profile 内，不在全局 PATH）：
 
 ```bash
-dsh-antigravity login      # 浏览器 OAuth 登录
-dsh-antigravity status     # 查看登录状态与模型列表
-dsh-antigravity logout     # 退出并清除本地凭据
-dsh-antigravity refresh    # 强制刷新 access token
+D=~/.dsh/profiles/web/node_modules/.bin/dsh-antigravity
+$D login      # 浏览器 OAuth 登录
+$D status     # 查看登录状态与模型列表
+$D logout     # 退出并清除本地凭据
+$D refresh    # 强制刷新 access token
 ```
+
+无头 / ACP 等没有浏览器界面的面走 `ctx.authorization` 注册的同一条 flow（key `dsh-antigravity/google-antigravity`，方法「使用 Google 账号登录」）。
 
 ### 选为默认模型
 
@@ -158,7 +171,8 @@ pnpm pack                  # prepack 会自动 build，产物只含 lib/
 ## 安全说明
 
 - 内置 OAuth 客户端是 Antigravity 桌面客户端凭据，无法真正保密；请通过 `clientId`/`clientSecret` 设置项或环境变量使用你自己的客户端。
-- 回环路由仅在 DSH 的 Web 载体下注册，并经过 Host/Origin 与浏览器认证校验；无 `connection` 服务时不注册。
+- 回环路由 `/dsh-antigravity/auth/*` 仅在 DSH 的 Web 载体下注册，并经过 Host/Origin 与浏览器认证校验；无 `connection` 服务时不注册。
+- OAuth 回调监听 `127.0.0.1:51121` 只在一次登录进行中存在，且无法被本机其他进程利用：回调必须回显本次尝试的 `state`，否则被忽略；任何中止路径都不会产生未处理的 rejection（DSH 的 fail-loud 处理器会因此退出进程）。
 - 凭据文件权限为 0600，且不会写入任何第三方应用的数据库。
 
 ## License

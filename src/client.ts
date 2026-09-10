@@ -195,6 +195,12 @@
       const authenticated = status != null && status.authenticated === true
       const pending = status != null && status.pending === true
       const expired = status != null && status.expired === true
+      // The host records why an attempt ended without a grant (cancelled,
+      // timed out, exchange failure). Without rendering it the card silently
+      // drops back to "not signed in" and the human is left guessing, so
+      // surface the reason unless the status line already says it.
+      const notice =
+        status != null && !authenticated && !pending && !expired && status.error ? String(status.error) : null
       const minutes =
         status == null || status.timeLeftSeconds == null
           ? null
@@ -290,6 +296,7 @@
         { style: styles.wrap, 'data-dsh-antigravity': 'card' },
         head,
         actions,
+        notice ? h('p', { key: 'notice', style: styles.hint }, notice) : null,
         error ? h('p', { key: 'error', style: styles.error }, `${copy.failed}: ${error}`) : null
       )
     }

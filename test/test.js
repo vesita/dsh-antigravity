@@ -8,11 +8,24 @@ import {
   getAuthorizationUrl,
   isExpiring,
   parseRedirectUri,
+  readAuthFile,
   resolveOAuthClient,
-  toGrantRecord
+  toGrantRecord,
+  writeAuthFile
 } from '../lib/auth.js'
 import { MODEL_CATALOG, resolveModelSpec } from '../lib/models.js'
 import antigravityPlugin from '../lib/index.js'
+
+/**
+ * Every test that touches credentials must stay inside a throwaway `DSH_HOME`:
+ * the closed-loop section signs out, and signing out is *supposed* to delete
+ * `~/.dsh/antigravity-auth.json`. Without this the suite would log the
+ * developer's own Antigravity account out.
+ */
+const { mkdtempSync } = await import('node:fs')
+const { tmpdir } = await import('node:os')
+const pathJoin = (await import('node:path')).join
+process.env.DSH_HOME = mkdtempSync(pathJoin(tmpdir(), 'dsh-antigravity-test-'))
 
 let passed = 0
 async function check(label, fn) {
@@ -350,5 +363,273 @@ await check('card ignores rows owned by another provider', () => {
   const face = registration.factory(requireFace(fakeReact()))
   assert.strictEqual(face.AntigravityCard({ provider: { provider: 'si-beat' } }), null)
 })
+await check('card says why an attempt ended without a grant', () => {
+  const face = registration.factory(
+    requireFace(fakeReact([{ authenticated: false, pending: false, error: '登录已取消' }]))
+  )
+  const text = textOf(face.AntigravityCard({ provider: { provider: 'google-antigravity' } })).join(' | ')
+  assert.match(text, /登录已取消/)
+})
+await check('card states an expired session once instead of echoing the host error', () => {
+  const face = registration.factory(
+    requireFace(fakeReact([{ authenticated: false, pending: false, expired: true, error: '令牌已过期' }]))
+  )
+  const text = textOf(face.AntigravityCard({ provider: { provider: 'google-antigravity' } })).join(' | ')
+  assert.match(text, /登录已过期/)
+  assert.doesNotMatch(text, /令牌已过期/)
+})
+
+// ---------------------------------------------------------------------------
+// The closed loop: no account -> add -> sign in -> remove.
+// ---------------------------------------------------------------------------
+
+/** An ephemeral loopback port the OAuth redirect can be pointed at. */
+async function freePort() {
+  const net = await import('node:net')
+  return new Promise((resolve, reject) => {
+    const probe = net.createServer()
+    probe.once('error', reject)
+    probe.listen(0, '127.0.0.1', () => {
+      const { port } = probe.address()
+      probe.close(() => resolve(port))
+    })
+  })
+}
+
+/** Let the mount's deferred `inject` callbacks run. */
+async function settle() {
+  for (let round = 0; round < 4; round += 1) await new Promise(resolve => setTimeout(resolve, 5))
+}
+
+console.log('# 7. 登录闭环的状态迁移与中止路径')
+const { LoginManager } = await import('../lib/auth-flow.js')
+
+const loopbackPort = await freePort()
+const redirectUri = `http://127.0.0.1:${loopbackPort}/oauth-callback`
+const manager = new LoginManager({ redirectUri, timeoutMs: 60_000 })
+
+await check('loop starts from "no account, no attempt"', () => {
+  const state = manager.status()
+  assert.strictEqual(state.pending, false)
+  assert.strictEqual(state.url, null)
+  assert.strictEqual(state.error, null)
+})
+const consentUrl = await manager.begin()
+await check('adding an account hands back a Google consent URL for this redirect', () => {
+  const url = new URL(consentUrl)
+  assert.strictEqual(url.host, 'accounts.google.com')
+  assert.strictEqual(url.searchParams.get('redirect_uri'), redirectUri)
+  assert(url.searchParams.get('scope').includes('/auth/cloud-platform'))
+  assert(url.searchParams.get('state').length >= 16)
+})
+await check('the attempt is pending and a second begin() joins it', async () => {
+  assert.strictEqual(manager.status().pending, true)
+  assert.strictEqual(await manager.begin(), consentUrl)
+})
+await check('a stray path on the loopback listener does not settle the attempt', async () => {
+  const response = await fetch(`http://127.0.0.1:${loopbackPort}/somewhere-else`)
+  assert.strictEqual(response.status, 404)
+  assert.strictEqual(manager.status().pending, true)
+})
+await check('a forged state is refused without cancelling the real attempt', async () => {
+  const response = await fetch(`http://127.0.0.1:${loopbackPort}/oauth-callback?code=forged&state=deadbeef`)
+  assert.strictEqual(response.status, 400)
+  assert.strictEqual(manager.status().pending, true, 'a stray callback must not cancel the sign-in')
+})
+await check('a denial carrying the right state ends the attempt and reports why', async () => {
+  const state = new URL(manager.status().url).searchParams.get('state')
+  const awaited = manager.completion()
+  const response = await fetch(`http://127.0.0.1:${loopbackPort}/oauth-callback?error=access_denied&state=${state}`)
+  assert.strictEqual(response.status, 400)
+  await assert.rejects(awaited, /access_denied/)
+  assert.strictEqual(manager.status().pending, false)
+  assert.match(manager.status().error, /access_denied/)
+})
+await check('cancel() ends the attempt and records the reason', async () => {
+  await manager.begin()
+  const awaited = manager.completion()
+  manager.cancel()
+  await assert.rejects(awaited, /取消/)
+  assert.strictEqual(manager.status().pending, false)
+  assert.match(manager.status().error, /取消/)
+})
+await check('a cancelled attempt can be started again', async () => {
+  const restarted = await manager.begin()
+  assert.notStrictEqual(restarted, consentUrl)
+  assert.strictEqual(manager.status().pending, true)
+  assert.strictEqual(manager.status().error, null)
+  manager.dispose()
+  assert.strictEqual(manager.status().pending, false)
+})
+await check('an abandoned attempt times out and records the reason', async () => {
+  const port = await freePort()
+  const shortLived = new LoginManager({ redirectUri: `http://127.0.0.1:${port}/oauth-callback`, timeoutMs: 40 })
+  await shortLived.begin()
+  const awaited = shortLived.completion()
+  await assert.rejects(awaited, /超时/)
+  assert.strictEqual(shortLived.status().pending, false)
+  assert.match(shortLived.status().error, /超时/)
+  shortLived.dispose()
+})
+
+console.log('# 8. 宿主路由闭环（/status → /login → /cancel → /logout）')
+const routes = new Map()
+const registeredPaths = []
+const fakeWebServer = {
+  register(options) {
+    routes.set(options.path, options)
+    registeredPaths.push(options.path)
+    return () => {
+      routes.delete(options.path)
+    }
+  }
+}
+const loopCtx = new Context()
+new LlmRuntime(loopCtx)
+loopCtx.provide('webServer', fakeWebServer)
+const hostPort = await freePort()
+const hostRedirect = `http://127.0.0.1:${hostPort}/oauth-callback`
+await loopCtx.plugin(antigravityPlugin, { redirectUri: hostRedirect })
+await settle()
+
+function fakeRes() {
+  return {
+    statusCode: 200,
+    headers: {},
+    body: '',
+    headersSent: false,
+    setHeader(name, value) {
+      this.headers[name] = value
+    },
+    writeHead(statusCode, headers) {
+      this.statusCode = statusCode
+      this.headersSent = true
+      Object.assign(this.headers, headers)
+    },
+    end(body) {
+      this.body = body ?? ''
+    }
+  }
+}
+
+/** Invoke a registered route handler the way the web server would. */
+async function request(method, path) {
+  const route = routes.get(path)
+  assert(route, `${path} must be registered`)
+  const res = fakeRes()
+  await route.handler({ method, url: path, headers: {} }, res)
+  return { status: res.statusCode, headers: res.headers, body: res.body ? JSON.parse(res.body) : null }
+}
+
+const STATUS = '/dsh-antigravity/auth/status'
+const LOGIN = '/dsh-antigravity/auth/login'
+const CANCEL = '/dsh-antigravity/auth/cancel'
+const LOGOUT = '/dsh-antigravity/auth/logout'
+
+await check('the host registers exactly the four routes the card calls', () => {
+  assert.deepStrictEqual([...registeredPaths].sort(), [CANCEL, LOGIN, LOGOUT, STATUS])
+})
+await check('no account: /status reports the signed-out posture', async () => {
+  const { status, body } = await request('GET', STATUS)
+  assert.strictEqual(status, 200)
+  assert.strictEqual(body.authenticated, false)
+  assert.strictEqual(body.expired, false)
+  assert.strictEqual(body.pending, false)
+})
+await check('add: /login opens an attempt and returns the consent URL', async () => {
+  const { status, body } = await request('POST', LOGIN)
+  assert.strictEqual(status, 200)
+  assert.strictEqual(body.pending, true)
+  assert.strictEqual(new URL(body.url).searchParams.get('redirect_uri'), hostRedirect)
+})
+await check('waiting: /status reports the attempt the browser must finish', async () => {
+  const { body } = await request('GET', STATUS)
+  assert.strictEqual(body.pending, true)
+  assert.strictEqual(body.authenticated, false)
+})
+await check('a wrong method is refused with Allow', async () => {
+  const { status, headers, body } = await request('POST', STATUS)
+  assert.strictEqual(status, 405)
+  assert.strictEqual(headers.Allow, 'GET')
+  assert.match(body.error, /GET/)
+})
+await check('cancel: /cancel ends the attempt and the card learns why', async () => {
+  const { status, body } = await request('POST', CANCEL)
+  assert.strictEqual(status, 200)
+  assert.strictEqual(body.pending, false)
+  const after = await request('GET', STATUS)
+  assert.strictEqual(after.body.pending, false)
+  assert.match(after.body.error, /取消/)
+})
+await check('an existing account is reported as signed in', async () => {
+  writeAuthFile({ access: 'seeded-access', projectId: 'aicode-consumers', expires: Date.now() + 3_600_000 })
+  const { body } = await request('GET', STATUS)
+  assert.strictEqual(body.authenticated, true)
+  assert.strictEqual(body.projectId, 'aicode-consumers')
+})
+await check('remove: /logout clears the account and closes the loop', async () => {
+  const { status, body } = await request('POST', LOGOUT)
+  assert.strictEqual(status, 200)
+  assert.strictEqual(body.authenticated, false)
+  assert.strictEqual(readAuthFile(), null, 'the credential mirror must be gone')
+  const after = await request('GET', STATUS)
+  assert.strictEqual(after.body.authenticated, false)
+  assert.strictEqual(after.body.expired, false)
+})
+await check('teardown during a pending attempt releases every route', async () => {
+  const { body } = await request('POST', LOGIN)
+  assert.strictEqual(body.pending, true)
+  await loopCtx.fiber.dispose()
+  assert.strictEqual(routes.size, 0)
+})
+
+console.log('# 9. 中止路径不得触发 DSH 的 fatal load failure')
+const { spawnSync } = await import('node:child_process')
+const authFlowHref = new URL('../lib/auth-flow.js', import.meta.url).href
+/**
+ * A child process wearing DSH's own fail-loud handler (`dsh-app-boot`
+ * `installFailLoud`), which answers any unhandled rejection by exiting 1. Each
+ * scenario drives the web path exactly as the settings card does: `begin()`
+ * with nobody awaiting `completion()`.
+ */
+const fatalSource = `
+process.on('unhandledRejection', error => {
+  process.stderr.write('fatal load failure: ' + (error instanceof Error ? error.message : String(error)) + '\\n')
+  process.exit(1)
+})
+const { LoginManager } = await import(${JSON.stringify(authFlowHref)})
+const scenario = process.env.SCENARIO
+const port = Number(process.env.PORT)
+const manager = new LoginManager({ redirectUri: 'http://127.0.0.1:' + port + '/oauth-callback', timeoutMs: 40 })
+await manager.begin()
+if (scenario === 'cancel') manager.cancel()
+else if (scenario === 'timeout') await new Promise(resolve => setTimeout(resolve, 250))
+else if (scenario === 'forged') await fetch('http://127.0.0.1:' + port + '/oauth-callback?code=x&state=wrong')
+else if (scenario === 'teardown') manager.dispose()
+else if (scenario === 'headless') {
+  const creds = await manager.completion().catch(() => null)
+  if (creds !== null) {
+    process.stderr.write('a failed attempt must not yield credentials\\n')
+    process.exit(1)
+  }
+}
+await new Promise(resolve => setTimeout(resolve, 250))
+manager.dispose()
+console.log('SURVIVED ' + scenario)
+`
+for (const scenario of ['cancel', 'timeout', 'forged', 'teardown', 'headless']) {
+  await check(`"${scenario}" leaves the host alive`, async () => {
+    const port = await freePort()
+    const run = spawnSync(process.execPath, ['--input-type=module', '-e', fatalSource], {
+      encoding: 'utf8',
+      timeout: 20_000,
+      env: { ...process.env, SCENARIO: scenario, PORT: String(port) }
+    })
+    const output = `${run.stdout}${run.stderr}`
+    assert(!/fatal load failure/.test(output), `DSH would have exited:\n${output.trim()}`)
+    assert.match(run.stdout, /SURVIVED/, `the child did not survive:\n${output.trim()}`)
+    assert.strictEqual(run.status, 0)
+  })
+}
 
 console.log(`\n所有 dsh-antigravity 单元测试通过（${passed} 项）`)
