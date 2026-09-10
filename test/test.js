@@ -217,8 +217,15 @@ await check('configurable entry belongs to llm-antigravity, not llm-pi-ai', () =
   const entry = ctx.llm.listConfigurableProviders().find(candidate => candidate.provider === 'google-antigravity')
   assert(entry, 'directory entry must exist')
   assert.strictEqual(entry.settingsNs, 'llm-antigravity')
-  assert.deepStrictEqual([...entry.settingsPath], [])
+  assert.deepStrictEqual([...entry.settingsPath], ['account'])
   assert.strictEqual(entry.declared, false)
+})
+await check('the account marker has no default, so the entry starts dormant', () => {
+  // `configured` is `settingsPath.length === 0 || getPath(value, settingsPath)
+  // !== undefined`, so an unset marker is what keeps the row out of the page
+  // until somebody signs in.
+  assert.strictEqual(antigravityPlugin.Config({}).account, undefined)
+  assert.strictEqual(antigravityPlugin.Config({ account: 'a@b.c' }).account, 'a@b.c', 'the schema must keep the marker')
 })
 await check('model metadata resolves through the runtime', async () => {
   const resolved = await ctx.llm.resolveModelInfo('google-antigravity', 'gemini-3.8-flash')
@@ -583,7 +590,116 @@ await check('teardown during a pending attempt releases every route', async () =
   assert.strictEqual(routes.size, 0)
 })
 
-console.log('# 9. 中止路径不得触发 DSH 的 fatal load failure')
+console.log('# 9. 账户标记：默认不出现，登录后出现，移除后消失')
+/** A stand-in for `ctx.settings`: records writes and can replay a removal. */
+function fakeSettings(initial = {}) {
+  let value = { ...initial }
+  let hooks = null
+  const calls = []
+  return {
+    service: {
+      installSection(owner, ns, schema, entry, captured) {
+        hooks = captured
+        captured.setSource(() => value)
+        captured.onChange()
+      },
+      async mutate(ns, ops) {
+        calls.push({ ns, ops })
+        for (const op of ops) {
+          if (op.path.length !== 1) continue
+          if (op.op === 'set') value = { ...value, [op.path[0]]: op.value }
+          else {
+            const { [op.path[0]]: _dropped, ...rest } = value
+            value = rest
+          }
+        }
+        if (hooks) hooks.onChange()
+      }
+    },
+    calls,
+    read: () => value,
+    /** What the row's native 「移除」 does: unset the path, then notify. */
+    removeAccountMarker() {
+      const { account, ...rest } = value
+      value = rest
+      if (hooks) hooks.onChange()
+    },
+    /** Any unrelated settings edit. */
+    notify() {
+      if (hooks) hooks.onChange()
+    }
+  }
+}
+
+const markerRoutes = new Map()
+const markerSettings = fakeSettings()
+const markerCtx = new Context()
+new LlmRuntime(markerCtx)
+markerCtx.provide('webServer', {
+  register(options) {
+    markerRoutes.set(options.path, options)
+    return () => markerRoutes.delete(options.path)
+  }
+})
+markerCtx.provide('settings', markerSettings.service)
+const markerPort = await freePort()
+await markerCtx.plugin(antigravityPlugin, { redirectUri: `http://127.0.0.1:${markerPort}/oauth-callback` })
+await settle()
+
+async function markerCall(method, path) {
+  const route = markerRoutes.get(path)
+  assert(route, `${path} must be registered`)
+  const res = fakeRes()
+  await route.handler({ method, url: path, headers: {} }, res)
+  return { status: res.statusCode, body: res.body ? JSON.parse(res.body) : null }
+}
+
+await check('signed out: looking at the card installs nothing', async () => {
+  const { body } = await markerCall('GET', STATUS)
+  assert.strictEqual(body.authenticated, false)
+  assert.deepStrictEqual(markerSettings.calls, [], 'no marker may be written without an account')
+  assert.strictEqual(markerSettings.read().account, undefined)
+})
+await check('an account with no marker installs the row when the card reads it', async () => {
+  writeAuthFile({ access: 'seeded-access', projectId: 'aicode-consumers', expires: Date.now() + 3_600_000 })
+  const { body } = await markerCall('GET', STATUS)
+  assert.strictEqual(body.authenticated, true)
+  const set = markerSettings.calls.filter(call => call.ops[0].op === 'set')
+  assert.deepStrictEqual(set, [
+    { ns: 'llm-antigravity', ops: [{ op: 'set', path: ['account'], value: 'aicode-consumers' }] }
+  ])
+  await markerCall('GET', STATUS)
+  assert.strictEqual(markerSettings.calls.length, 1, 'a present marker must not be rewritten')
+})
+await check('an unrelated settings edit keeps the grant', async () => {
+  markerSettings.notify()
+  await settle()
+  assert(markerSettings.calls.length === 1)
+  assert(readAuthFile(), 'the grant must survive a settings change that leaves the marker alone')
+})
+await check('the row\'s native 移除 takes the account with it', async () => {
+  markerSettings.removeAccountMarker()
+  await settle()
+  assert.strictEqual(markerSettings.read().account, undefined)
+  assert.strictEqual(readAuthFile(), null, 'removing the marker must remove the grant')
+})
+await check('signing out clears the grant and the marker, so the row goes away', async () => {
+  writeAuthFile({ access: 'seeded-access', projectId: 'aicode-consumers', expires: Date.now() + 3_600_000 })
+  await markerCall('GET', STATUS)
+  assert.strictEqual(markerSettings.read().account, 'aicode-consumers')
+  const { status, body } = await markerCall('POST', LOGOUT)
+  assert.strictEqual(status, 200)
+  assert.strictEqual(body.authenticated, false)
+  assert.strictEqual(readAuthFile(), null)
+  assert.strictEqual(markerSettings.read().account, undefined)
+  assert(markerSettings.calls.some(call => call.ops[0].op === 'unset'), 'the marker must be withdrawn')
+})
+await check('marker-side teardown releases the routes', async () => {
+  await markerCtx.fiber.dispose()
+  assert.strictEqual(markerRoutes.size, 0)
+})
+
+console.log('# 10. 中止路径不得触发 DSH 的 fatal load failure')
 const { spawnSync } = await import('node:child_process')
 const authFlowHref = new URL('../lib/auth-flow.js', import.meta.url).href
 /**

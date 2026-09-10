@@ -27,6 +27,9 @@ import { createProxyServer } from './proxy.js'
  *   `ctx.llm.registerAdapter`, never through `llm-pi-ai`);
  * - credentials live in `ctx.credentials` (with a private file fallback) under
  *   the `dsh-antigravity/google-antigravity` record key;
+ * - the provider row is installed by the `llm-antigravity.account` settings
+ *   marker, which this plugin writes on sign-in and withdraws on removal, so
+ *   the entry is dormant in 「添加提供方」 until an account actually exists;
  * - sign-in is offered both as a DSH authorization flow (headless/ACP) and as
  *   loopback HTTP routes consumed by this package's browser half.
  *
@@ -48,6 +51,14 @@ const ROUTE_PREFIX = '/dsh-antigravity/auth'
  * hands it back after schema defaulting.
  */
 interface AntigravitySettings {
+  /**
+   * Directory marker: present exactly while an account is installed here. It
+   * carries a human-readable label, not a credential — the grant itself lives
+   * in `ctx.credentials`. Its presence is what makes the provider row appear in
+   * Settings → Models, so this plugin writes it when a sign-in lands and clears
+   * it when the account is removed.
+   */
+  account?: string
   models?: ModelSpec[]
   endpoint?: string
   projectId?: string
@@ -66,6 +77,19 @@ interface AntigravitySettings {
 /** Attachment reference as the image resolver reads it. */
 interface ImageRef {
   mediaType?: string
+}
+
+/**
+ * Minimal structural view of the `ctx.settings` service: the path-op write the
+ * models page itself uses, which is how this plugin installs and withdraws the
+ * `account` marker.
+ */
+interface SettingsSeam {
+  mutate(
+    ns: string,
+    ops: Array<{ op: 'set'; path: string[]; value: unknown } | { op: 'unset'; path: string[] }>,
+    expectedRevision?: number
+  ): Promise<unknown>
 }
 
 /** Shape of the `/status` payload the browser half consumes. */
@@ -93,6 +117,7 @@ const modelSchema = z.object({
 })
 
 export const Config = z.object({
+  account: z.string(),
   models: z.array(modelSchema).default(MODEL_CATALOG),
   endpoint: z.string().default('https://daily-cloudcode-pa.googleapis.com'),
   projectId: z.string(),
@@ -119,12 +144,15 @@ export function apply(ctx: any, config: AntigravitySettings = {}): void {
   let current: () => AntigravitySettings = () => config
   let proxyServer: Server | null = null
   let proxyKey: string | null = null
+  /** Last observed value of the `account` marker, for set → unset detection. */
+  let previousAccount: string | undefined
 
   const catalog = (): ModelSpec[] => {
     const models = current().models
     return Array.isArray(models) && models.length > 0 ? models : MODEL_CATALOG
   }
   const credentialsService = (): CredentialsSeam | undefined => ctx.get('credentials')
+  const settingsService = (): SettingsSeam | undefined => ctx.get('settings')
   const oauthOptions = () => ({
     clientId: current().clientId,
     clientSecret: current().clientSecret,
@@ -145,12 +173,62 @@ export function apply(ctx: any, config: AntigravitySettings = {}): void {
   }
 
   // -------------------------------------------------------------------------
+  // Account marker (the provider row's installation record)
+  // -------------------------------------------------------------------------
+  /**
+   * Publish the settings marker that installs the provider row. Without it the
+   * entry stays dormant in the 「添加提供方」 select, which is the default state:
+   * a provider nobody signed in to owns no row in Settings → Models.
+   */
+  const markAccountInstalled = async (creds: AntigravityCredentials): Promise<void> => {
+    const settings = settingsService()
+    if (settings === undefined) return
+    const label = creds.email || creds.projectId || 'google'
+    if (current().account === label) return
+    try {
+      await settings.mutate(NS, [{ op: 'set', path: ['account'], value: label }])
+    } catch (error: any) {
+      // The grant is already committed, so a marker write that fails must not
+      // fail the sign-in: the next status read retries it.
+      ctx.logger?.warn?.(`dsh-antigravity: 无法写入账户标记：${error.message}`)
+    }
+  }
+
+  /** Withdraw the marker; the row disappears, which is the removal half of the loop. */
+  const unmarkAccount = async (): Promise<void> => {
+    if (current().account === undefined) return
+    const settings = settingsService()
+    if (settings === undefined) return
+    try {
+      await settings.mutate(NS, [{ op: 'unset', path: ['account'] }])
+    } catch {
+      /* gone already, or the settings provider is read-only */
+    }
+  }
+
+  /**
+   * Keep the marker and the grant in step. The marker *is* how the account is
+   * installed, so its removal — this plugin's 退出登录, the row's native
+   * 「移除」, or a hand edit of `settings.yaml` — removes the grant too.
+   *
+   * Only the set → unset transition counts: a grant installed by the standalone
+   * CLI never had a marker, and an unrelated settings edit must not delete it.
+   */
+  const reconcileAccount = (): void => {
+    const account = current().account
+    const removed = previousAccount !== undefined && account === undefined
+    previousAccount = account
+    if (removed) void clearCredentials(credentialsService())
+  }
+
+  // -------------------------------------------------------------------------
   // Sign-in
   // -------------------------------------------------------------------------
   const login = new LoginManager({
     ...oauthOptions(),
     onSuccess: async (creds: AntigravityCredentials) => {
       await saveCredentials(credentialsService(), creds)
+      await markAccountInstalled(creds)
     }
   })
   ctx.effect(() => () => login.dispose(), 'dsh-antigravity: login manager')
@@ -174,7 +252,10 @@ export function apply(ctx: any, config: AntigravitySettings = {}): void {
       provider: PROVIDER,
       displayName: 'Google Antigravity',
       settingsNs: NS,
-      settingsPath: [],
+      // A non-empty path is what keeps this entry dormant until the account
+      // marker exists: `configured` is false without it, so the provider is
+      // listed in 「添加提供方」 instead of owning a row from the start.
+      settingsPath: ['account'],
       declared: false
     }
   ])
@@ -234,6 +315,7 @@ export function apply(ctx: any, config: AntigravitySettings = {}): void {
       onChange: () => {
         login.configure(oauthOptions())
         reconcileProxy()
+        reconcileAccount()
       },
       validate: (value: AntigravitySettings) => {
         if (!Array.isArray(value.models) || value.models.length === 0) {
@@ -242,6 +324,7 @@ export function apply(ctx: any, config: AntigravitySettings = {}): void {
       }
     })
     login.configure(oauthOptions())
+    previousAccount = current().account
     reconcileProxy()
   })
 
@@ -260,6 +343,7 @@ export function apply(ctx: any, config: AntigravitySettings = {}): void {
         if (!creds) throw new Error('登录未完成')
         // The seam verifies the record was committed during this attempt.
         await writeCredentialRecord(credentialsService(), creds)
+        await markAccountInstalled(creds)
       }
     })
   })
@@ -284,6 +368,11 @@ export function apply(ctx: any, config: AntigravitySettings = {}): void {
         // Resolve (and refresh, when possible) so the card never claims a live
         // session on the strength of an expired access token.
         const creds = await getValidCredentials(credentialsService(), oauthOptions())
+        // An account installed outside this card — a grant the CLI wrote, or one
+        // that predates the marker — has no row to sit in. Reading the card is
+        // the moment that becomes visible, so install the marker here rather
+        // than writing settings during plugin load.
+        await markAccountInstalled(creds)
         return {
           authenticated: true,
           email: creds.email ?? null,
@@ -371,6 +460,9 @@ export function apply(ctx: any, config: AntigravitySettings = {}): void {
             if (req.method !== 'POST') return methodNotAllowed(res, 'POST')
             login.cancel()
             await clearCredentials(credentialsService())
+            // Closing the loop: without the marker the provider row goes away,
+            // so the next sign-in starts from 「添加提供方」 again.
+            await unmarkAccount()
             sendJson(res, 200, { authenticated: false })
           }
         }),

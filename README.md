@@ -24,7 +24,17 @@ DeepSeek Harness (DSH) 的 **Google Antigravity** 模型提供商插件：原生
 
 ### 账户闭环：没有账户 → 添加 → 登录 → 移除
 
-Antigravity 的账户就是它的凭据，所以这三步都在**同一个地方**完成：**设置 → 模型** 里 **Google Antigravity** 那一行内的卡片。它不会出现在「添加提供方」下拉里 —— 那个下拉只列 `configured === false` 的条目，而本插件的目录条目 `settingsPath` 为空，`configured` 恒为真；换句话说，能在行里看到它，就注定它不在下拉里（两者互斥，`deepseek-official` 同理）。
+**默认状态是「没有这一行」。** 插件注册的目录条目 `settingsPath: ['account']`，而 `account` 没有 schema 默认值，于是 `configured` 为假 —— 设置页不会出现 Google Antigravity 行，只在 **添加提供方** 下拉里留一个条目。这满足 DSH 的两条互斥规则：`configured === false` 才进下拉，`configured === true` 才成行（`deepseek-official` 同理，只是它恒为真）。
+
+安装一个账户 = 让那个标记出现。写标记的人就是插件自己：
+
+| 步骤 | 你做什么 | 插件做什么 |
+| --- | --- | --- |
+| **添加 + 登录** | **设置 → 模型 → 添加提供方 → Google Antigravity**，在卡片里点 **登录 Google 账号** | 起回环监听 `http://127.0.0.1:51121/oauth-callback` 并打开授权页；授权落地后写入凭据，再把 `llm-antigravity.account` 写进 `settings.yaml` —— 行随之出现 |
+| **移除** | 行内点 **退出登录**，或行右上角点 **移除** | 两者都清空凭据（记录 + 镜像）并撤掉 `account` 标记，行随之消失，回到下拉里 |
+| **取消** | 等待授权时点 **取消**（或关掉授权页直到 10 分钟超时） | 结束本次尝试，卡片说明原因 |
+
+卡片在两种位置都会渲染：下拉里的草稿卡（此时是「添加」）和已经成行的行卡（此时是「管理」）。状态与操作完全一致：
 
 | 卡片状态 | 显示 | 可用的操作 |
 | --- | --- | --- |
@@ -33,13 +43,16 @@ Antigravity 的账户就是它的凭据，所以这三步都在**同一个地方
 | 凭据过期 | 红点 + 登录已过期，请重新登录 | **登录 Google 账号** |
 | 已登录 | 绿点 + 已登录 · 项目 · 令牌有效期 | **退出登录** |
 
-1. **添加 + 登录**：点 **登录 Google 账号**。宿主在 `http://127.0.0.1:51121/oauth-callback` 起一个回环监听并打开 Google 授权页；授权后浏览器重定向回该回环地址，凭据写入下面「凭据存放位置」的两处。卡片在等待期间每 1.5 秒轮询一次 `/status`，成功后自动变为已登录。
-2. **移除**：点 **退出登录**。它会先取消进行中的授权，再清空凭据记录与镜像文件，卡片回到「未登录」。行右上角的 **移除** 按钮不会出现 —— 那个按钮只删除能写进 settings 的 profile，删不掉 OAuth 凭据。
-3. **取消**：等待授权时点 **取消**（或关掉授权页直到 10 分钟超时）会结束本次尝试；卡片会把你送回「未登录」，并在下方说明原因。
+`account` 是**目录标记，不是凭据**：它只记一个可读的标签（邮箱或项目 ID），真正的授权在 `ctx.credentials` 里。两条规则保证两者一致：
+
+- 读卡片时若发现账户存在但标记缺失（例如凭据是 CLI 装的，或来自更早的版本），插件会把标记补上 —— 账户存在就该有行；
+- 标记从「有」变「无」时（原生 **移除**、或你手改 `settings.yaml` 删掉它），插件同时删掉凭据。只有这个**状态迁移**会删凭据：CLI 装的凭据从来没有标记，无关的设置改动也不会碰它。
+
+> 原生编辑器的「应用」按钮对非 `llm-deepseek` / `llm-pi-ai` 的命名空间是永久禁用的（DSH 只给这两个布局做了表单），所以「添加」这一步必须由插件自己写 settings —— 光靠页面上的保存按钮，条目会永远卡在下拉里。
 
 同一个插件只维护一份账户：凭据 key 固定为 `dsh-antigravity/google-antigravity`，再次登录是**覆盖**而不是新增。
 
-也可以在终端走同样的闭环（插件装在 profile 内，所以可执行文件也在 profile 内，不在全局 PATH）：
+也可以在终端操作凭据（插件装在 profile 内，所以可执行文件也在 profile 内，不在全局 PATH）。CLI 只碰凭据、不写 settings，所以它登录后行不会自己出现 —— 下次打开那张卡片时会补齐标记：
 
 ```bash
 D=~/.dsh/profiles/web/node_modules/.bin/dsh-antigravity
@@ -49,7 +62,7 @@ $D logout     # 退出并清除本地凭据
 $D refresh    # 强制刷新 access token
 ```
 
-无头 / ACP 等没有浏览器界面的面走 `ctx.authorization` 注册的同一条 flow（key `dsh-antigravity/google-antigravity`，方法「使用 Google 账号登录」）。
+无头 / ACP 等没有浏览器界面的面走 `ctx.authorization` 注册的同一条 flow（key `dsh-antigravity/google-antigravity`，方法「使用 Google 账号登录」），它同样会写标记。
 
 ### 选为默认模型
 
@@ -88,6 +101,7 @@ dsh-antigravity proxy --port 8045
 
 | 字段 | 默认 | 说明 |
 | --- | --- | --- |
+| `account` | 未设置 | **账户标记**：存在即表示此账户已安装，设置页才会出现该行。由插件在登录时写入、退出登录/移除时删除；手工删掉它等于移除账户 |
 | `models` | 内置 11 个模型 | 可覆盖/增删；每项含 `id`、`wireId`、`name`、`contextWindow`、`maxTokens`、`reasoning`、`inputModalities` |
 | `endpoint` | `https://daily-cloudcode-pa.googleapis.com` | 首选端点，失败后回退到内置端点列表 |
 | `projectId` | 登录时自动发现 | Antigravity 项目 ID，缺省 `aicode-consumers` |
