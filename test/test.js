@@ -278,9 +278,12 @@ await check('bundle registers under the package id', () => {
  * Faithful stand-ins for the two static seeds the bundle requires. The
  * `createElement` shape matters: children are the trailing arguments, which is
  * exactly what a `jsx`/`jsxs` third argument is NOT (there it is the key).
+ * `refs` is the identity axis a re-render shares with its mount, so a card can
+ * be exercised across the render where its props change.
  */
-function fakeReact(initialStates = []) {
+function fakeReact(initialStates = [], refs = []) {
   const queue = [...initialStates]
+  let refIndex = 0
   return {
     createElement(type, props, ...children) {
       const base = props == null ? {} : { ...props }
@@ -289,6 +292,11 @@ function fakeReact(initialStates = []) {
       return { type, props: base }
     },
     useState: value => [queue.length > 0 ? queue.shift() : value, () => {}],
+    useRef: value => {
+      const index = refIndex++
+      refs[index] ??= { current: value }
+      return refs[index]
+    },
     useEffect: () => {},
     useCallback: fn => fn
   }
@@ -376,6 +384,49 @@ await check('card says why an attempt ended without a grant', () => {
   )
   const text = textOf(face.AntigravityCard({ provider: { provider: 'google-antigravity' } })).join(' | ')
   assert.match(text, /登录已取消/)
+})
+await check('the draft copy renders while the provider still has no row', () => {
+  const face = registration.factory(
+    requireFace(fakeReact([{ authenticated: true, email: 'a@b.c' }], []))
+  )
+  const text = textOf(
+    face.AntigravityCard({
+      provider: { provider: 'google-antigravity', settingsNs: 'llm-antigravity' },
+      configured: false
+    })
+  ).join(' | ')
+  assert.match(text, /已登录/, 'the dormant entry still needs its card')
+})
+await check('the draft copy drops out once the marker installs the saved row', () => {
+  // Same instance across both renders: it mounted from the dormant row, then
+  // the sign-in wrote `llm-antigravity.account` and the row appeared.
+  const refs = []
+  const mounted = registration.factory(
+    requireFace(fakeReact([{ authenticated: true, email: 'a@b.c' }], refs))
+  )
+  const dormant = { provider: { provider: 'google-antigravity', settingsNs: 'llm-antigravity' }, configured: false }
+  assert.notStrictEqual(mounted.AntigravityCard(dormant), null)
+  const rerendered = registration.factory(
+    requireFace(fakeReact([{ authenticated: true, email: 'a@b.c' }], refs))
+  )
+  assert.strictEqual(
+    rerendered.AntigravityCard({ ...dormant, configured: true }),
+    null,
+    'the draft must not keep a card the saved row already renders'
+  )
+})
+await check('the saved row copy keeps its card once configured', () => {
+  const face = registration.factory(
+    requireFace(fakeReact([{ authenticated: true, email: 'a@b.c', projectId: 'proj', timeLeftSeconds: 600 }]))
+  )
+  const text = textOf(
+    face.AntigravityCard({
+      provider: { provider: 'google-antigravity', settingsNs: 'llm-antigravity' },
+      configured: true
+    })
+  ).join(' | ')
+  assert.match(text, /已登录/)
+  assert.match(text, /退出登录/)
 })
 await check('card states an expired session once instead of echoing the host error', () => {
   const face = registration.factory(

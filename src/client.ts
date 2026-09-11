@@ -118,6 +118,18 @@
 
     function AntigravityCard(props: any) {
       const provider = props && props.provider
+      /**
+       * Whether this instance mounted while the provider still had no installed
+       * row, i.e. it is the 「添加提供方」 draft's copy of the card.
+       *
+       * The owner dispatches this keyed cell with the same directory row from
+       * both sites, so no prop distinguishes "draft" from "saved row" — mount
+       * time is the one fact that does. The saved row only exists once the
+       * account marker is written, so it always mounts `configured === true`,
+       * while the draft mounts the cell from the dormant entry
+       * (`configured === false`).
+       */
+      const draftCopy = React.useRef(props == null || props.configured !== true).current
       const [status, setStatus] = React.useState(null)
       const [busy, setBusy] = React.useState(false)
       const [error, setError] = React.useState(null)
@@ -191,6 +203,14 @@
         })
 
       if (provider && provider.provider && provider.provider !== PROVIDER) return null
+      // Once the marker lands the provider owns a saved row, and the draft's
+      // copy has nothing left to say. The native page leaves its own draft open
+      // after a sign-in (the card writes settings itself, so no editor close
+      // ever runs to clear it), while the entry has already left the draft's
+      // provider select — so a card still rendered here reads as if it belonged
+      // to whichever provider that select falls back to. The saved row carries
+      // the same status and actions, so dropping this copy loses nothing.
+      if (draftCopy && props != null && props.configured === true) return null
 
       const authenticated = status != null && status.authenticated === true
       const pending = status != null && status.pending === true
