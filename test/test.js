@@ -1,7 +1,7 @@
 import assert from 'node:assert'
 import { Context } from '@deepseek-ai/cordis'
 import { LlmRuntime } from '@deepseek-ai/dsh-llm'
-import { buildRequest, mapUsage, parseStream } from '../lib/adapter.js'
+import { GoogleAntigravityAdapter, buildRequest, mapUsage, parseStream } from '../lib/adapter.js'
 import {
   CREDENTIAL_KEY,
   fromGrantRecord,
@@ -949,6 +949,58 @@ for (const scenario of ['cancel', 'timeout', 'forged', 'teardown', 'headless']) 
     assert(!/fatal load failure/.test(output), `DSH would have exited:\n${output.trim()}`)
     assert.match(run.stdout, /SURVIVED/, `the child did not survive:\n${output.trim()}`)
     assert.strictEqual(run.status, 0)
+  })
+}
+
+console.log('# 11. providerRetryPolicy 必须交出「可被 dsh-llm-retry 消费」的策略')
+// 消费者的那一行逐字来自 dsh-llm-retry/lib/index.js:160：
+//     } else if (!policy.retryableCodes.includes(failure.code)) return next();
+// 旧实现的冷启动兜底是 `{ mode: 'normal', maxRetries: 3 }`（**没有** retryableCodes），
+// 而 dsh-llm 只在适配器返回 undefined 时才补默认 —— 于是这条路径**只在 provider 失败时**才炸：
+// TypeError「Cannot read properties of undefined (reading 'includes')」盖掉真正的 TRANSPORT 错误
+// （实测：'连接任何 Google Antigravity 端点均失败' 被盖成 UNKNOWN）。
+{
+  const cold = new GoogleAntigravityAdapter({})
+  await check('冷启动（无 resolver）返回 undefined，绝不是一个残缺策略', () => {
+    assert.strictEqual(cold.providerRetryPolicy(), undefined)
+  })
+
+  const partial = new GoogleAntigravityAdapter({ resolveRetryPolicy: () => ({ mode: 'normal', maxRetries: 3 }) })
+  await check('resolver 交回缺 retryableCodes 的 normal 策略 -> undefined', () => {
+    assert.strictEqual(partial.providerRetryPolicy(), undefined)
+  })
+
+  const complete = Object.freeze({
+    mode: 'normal', maxRetries: 3, retryableCodes: Object.freeze(['TRANSPORT']), maxDelayMs: 4000
+  })
+  const full = new GoogleAntigravityAdapter({ resolveRetryPolicy: () => complete })
+  await check('完整的 normal 策略按同一性透传（不重建、不改写）', () => {
+    assert.strictEqual(full.providerRetryPolicy(), complete)
+  })
+
+  // 'always' 策略**本来就没有** retryableCodes（消费者在 mode === 'always' 分支根本不读它），
+  // 护栏必须放行它 —— 否则等于把用户设的 always 静默降级成默认。
+  const always = Object.freeze({ mode: 'always', maxDelayMs: 4000 })
+  const alwaysAdapter = new GoogleAntigravityAdapter({ resolveRetryPolicy: () => always })
+  await check('always 策略（无 retryableCodes 字段）原样透传', () => {
+    assert.strictEqual(alwaysAdapter.providerRetryPolicy(), always)
+  })
+
+  await check('适配器交出的每个策略都能活着走过消费者那一行', () => {
+    for (const adapter of [cold, partial, full, alwaysAdapter]) {
+      const policy = adapter.providerRetryPolicy()
+      if (policy === undefined) continue // undefined 由 dsh-llm 换成它自己的完整默认
+      assert.doesNotThrow(() => {
+        if (policy.mode === 'always') return
+        policy.retryableCodes.includes('TRANSPORT')
+      })
+    }
+  })
+
+  // 负向对照：证明上面那条断言**真的会失败** —— 旧实现的冷启动字面量确实在消费点抛 TypeError。
+  await check('负向对照：旧的冷启动字面量在消费点抛 TypeError', () => {
+    const legacy = { mode: 'normal', maxRetries: 3 }
+    assert.throws(() => { legacy.retryableCodes.includes('TRANSPORT') }, TypeError)
   })
 }
 

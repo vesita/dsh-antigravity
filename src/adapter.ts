@@ -184,10 +184,22 @@ export class GoogleAntigravityAdapter extends LlmAdapter {
   }
 
   providerRetryPolicy(): ResolvedRetryPolicy | undefined {
-    // Settings own the fully resolved policy; this literal covers only the
-    // adapter's own cold start.
-    const fallback = { mode: 'normal', maxRetries: 3 } as ResolvedRetryPolicy
-    return this.options.resolveRetryPolicy?.() ?? fallback
+    // Settings own the fully resolved policy; when they name none this returns
+    // `undefined` so dsh-llm resolves its own complete frozen defaults
+    // (`mode` + `maxRetries` + `retryableCodes` + `maxDelayMs`).
+    //
+    // Never hand back a hand-rolled partial literal here: `dsh-llm-retry` reads
+    // `policy.retryableCodes.includes(failure.code)` the first time a provider
+    // call fails (dsh-llm-retry/lib/index.js:160), so a policy without
+    // `retryableCodes` throws `Cannot read properties of undefined (reading
+    // 'includes')` and **masks the provider's real error** — measured as an
+    // UNKNOWN TypeError hiding a TRANSPORT failure ("连接任何 Google Antigravity
+    // 端点均失败"). `mode: 'always'` legitimately carries no `retryableCodes`
+    // (the consumer never reads it on that branch), so it passes through.
+    const resolved = this.options.resolveRetryPolicy?.()
+    if (resolved === undefined || resolved.mode === 'always') return resolved
+    if (!Array.isArray(resolved.retryableCodes) || resolved.retryableCodes.length === 0) return undefined
+    return resolved
   }
 
   async listModels(provider: string): Promise<LlmModelInfo[]> {
