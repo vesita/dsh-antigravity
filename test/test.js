@@ -1004,4 +1004,73 @@ console.log('# 11. providerRetryPolicy 必须交出「可被 dsh-llm-retry 消�
   })
 }
 
+console.log('# 12. 空回答必须变成可重试的失败（EMPTY_RESPONSE）')
+
+/** Feed one SSE script through parseStream and collect every emitted chunk. */
+async function parseSse(events) {
+  const body = new ReadableStream({
+    start(controller) {
+      const encoder = new TextEncoder()
+      for (const event of events) controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`))
+      controller.close()
+    }
+  })
+  const collected = []
+  for await (const chunk of parseStream(new Response(body), resolveModelSpec('gemini-3.8-flash'))) collected.push(chunk)
+  return collected
+}
+
+const finishOf = chunks => chunks.find(chunk => chunk.type === 'finish')
+
+const emptyStream = await parseSse([
+  { response: { candidates: [{ finishReason: 'STOP', content: { parts: [] } }], usageMetadata: { promptTokenCount: 7 } } }
+])
+
+await check('零内容 + stop -> error finish，code 是 EMPTY_RESPONSE', () => {
+  const finish = finishOf(emptyStream)
+  assert.strictEqual(finish.reason.kind, 'error')
+  assert.strictEqual(finish.reason.failure.code, 'EMPTY_RESPONSE')
+})
+await check('空回答的 message 与生态先例逐字一致', () => {
+  assert.strictEqual(
+    finishOf(emptyStream).reason.failure.message,
+    'model returned a completed response with no content'
+  )
+})
+await check('空回答只产出一个 finish（普通 finish 不得同时出现）', () => {
+  assert.strictEqual(emptyStream.filter(chunk => chunk.type === 'finish').length, 1)
+})
+await check('空回答仍产出 usage', () => {
+  assert(emptyStream.some(chunk => chunk.type === 'usage'))
+})
+
+const textStream = await parseSse([
+  { response: { candidates: [{ content: { parts: [{ text: 'hi' }] } }] } },
+  { response: { candidates: [{ finishReason: 'STOP', content: { parts: [] } }] } }
+])
+await check('负控：有文本 + stop -> 正常 stop，不得改写成 error', () => {
+  assert.strictEqual(finishOf(textStream).reason.kind, 'stop')
+})
+
+const toolStream = await parseSse([
+  { response: { candidates: [{ content: { parts: [{ functionCall: { name: 'read', args: {}, id: 'c1' } }] } }] } }
+])
+await check('负控：只有 tool call -> tool-calls，不得改写成 error', () => {
+  assert.strictEqual(finishOf(toolStream).reason.kind, 'tool-calls')
+})
+
+const reasoningStream = await parseSse([
+  { response: { candidates: [{ content: { parts: [{ thought: true, text: 'thinking' }] } }] } }
+])
+await check('负控：只有 reasoning 块 -> stop（reasoning 也算内容）', () => {
+  assert.strictEqual(finishOf(reasoningStream).reason.kind, 'stop')
+})
+
+const cappedStream = await parseSse([
+  { response: { candidates: [{ finishReason: 'MAX_TOKENS', content: { parts: [] } }] } }
+])
+await check('负控：零内容 + MAX_TOKENS -> max-tokens（独立结局，不算空回答）', () => {
+  assert.strictEqual(finishOf(cappedStream).reason.kind, 'max-tokens')
+})
+
 console.log(`\n所有 dsh-antigravity 单元测试通过（${passed} 项）`)

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { LlmAdapter, LlmError } from '@deepseek-ai/dsh-llm'
+import { EMPTY_RESPONSE_CODE, LlmAdapter, LlmError } from '@deepseek-ai/dsh-llm'
 import type {
   ContentBlock,
   FinishReason,
@@ -184,18 +184,15 @@ export class GoogleAntigravityAdapter extends LlmAdapter {
   }
 
   providerRetryPolicy(): ResolvedRetryPolicy | undefined {
-    // Settings own the fully resolved policy; when they name none this returns
-    // `undefined` so dsh-llm resolves its own complete frozen defaults
-    // (`mode` + `maxRetries` + `retryableCodes` + `maxDelayMs`).
+    // 策略由 settings 全权决定；它没给就返回 `undefined`，让 dsh-llm 自己解析完整的
+    // 冻结默认值（`mode` + `maxRetries` + `retryableCodes` + `maxDelayMs`）。
     //
-    // Never hand back a hand-rolled partial literal here: `dsh-llm-retry` reads
-    // `policy.retryableCodes.includes(failure.code)` the first time a provider
-    // call fails (dsh-llm-retry/lib/index.js:160), so a policy without
-    // `retryableCodes` throws `Cannot read properties of undefined (reading
-    // 'includes')` and **masks the provider's real error** — measured as an
-    // UNKNOWN TypeError hiding a TRANSPORT failure ("连接任何 Google Antigravity
-    // 端点均失败"). `mode: 'always'` legitimately carries no `retryableCodes`
-    // (the consumer never reads it on that branch), so it passes through.
+    // **绝不**在这里手写半条字面量：`dsh-llm-retry` 在首次调用失败时就读
+    // `policy.retryableCodes.includes(failure.code)`（dsh-llm-retry/lib/index.js:160），
+    // 缺 `retryableCodes` 的策略会抛 `Cannot read properties of undefined (reading
+    // 'includes')`，把 provider 的真实故障**盖成** UNKNOWN —— 实测就是一次 TRANSPORT
+    // 故障（「连接任何 Google Antigravity 端点均失败」）被 TypeError 掩盖。
+    // `mode: 'always'` 合法地不带 `retryableCodes`（消费方在该分支根本不读它），原样透传。
     const resolved = this.options.resolveRetryPolicy?.()
     if (resolved === undefined || resolved.mode === 'always') return resolved
     if (!Array.isArray(resolved.retryableCodes) || resolved.retryableCodes.length === 0) return undefined
@@ -657,6 +654,28 @@ export async function* parseStream(
   const ended = endActive()
   if (ended) yield ended
   if (usage) yield { type: 'usage', usage }
+  // 空回答必须变成**可重试的失败**，绝不许当成正常结束：一条零内容的 `stop` 会让
+  // agent loop 提交一条空的 assistant 消息、把 turn 记成 `completed`，于是委派它的
+  // 父会话只看到「成功但什么都没有」，而重试一次都不会跑（本路由实测：子代理空收尾、
+  // `outputTokens: 0`、turn `completed`、`model-retry` 事件为零）。
+  // `EMPTY_RESPONSE` 本来就在 dsh-llm 的默认可重试码里（dsh-llm/lib/index.js:232-242），
+  // 消费处是 dsh-llm-retry（lib/index.js:160），所以 `providerRetryPolicy` 一行都不用动 ——
+  // 这也顺便避开了那个「半条字面量掩盖真实故障」的陷阱。
+  // 文案与行为与生态先例逐字一致：
+  // dsh-llm-deepseek/lib/index.js:1238-1246 与 dsh-llm-pi-ai/lib/index.js:1399-1407。
+  if (blockIndex === 0 && finishReason === 'stop') {
+    yield {
+      type: 'finish',
+      reason: {
+        kind: 'error',
+        failure: {
+          message: 'model returned a completed response with no content',
+          code: EMPTY_RESPONSE_CODE
+        }
+      } as FinishReason
+    }
+    return
+  }
   // A completed tool call must run even when the same turn also hit the output
   // cap, so tool-calls outranks max-tokens.
   const kind = sawToolCall ? 'tool-calls' : finishReason
