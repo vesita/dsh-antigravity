@@ -55,6 +55,14 @@ export interface UsageSnapshot {
   ranges: readonly UsageRange[]
   generatedAt: number
   overview: UsageOverview
+  /**
+   * The all-time total, independent of `range`.
+   *
+   * "How much have I used in total" is a different question from "in this
+   * window", so it gets its own figure rather than making the reader switch the
+   * whole panel to the widest range and read it back out of the cards.
+   */
+  lifetime: UsageOverview
   series: UsageSeriesPoint[]
   models: UsageGroupView[]
   projects: UsageGroupView[]
@@ -151,11 +159,17 @@ export function buildSnapshot(
     overview: group.overview
   }))
 
+  const overview = summarize(records, pricing)
+  // Widest range already IS the lifetime total, so the extra pass is skipped
+  // exactly when it would be redundant.
+  const lifetime = spec.since === undefined ? overview : summarize(store.query({}), pricing)
+
   return {
     range,
     ranges: USAGE_RANGES,
     generatedAt: now,
-    overview: summarize(records, pricing),
+    overview,
+    lifetime,
     series: seriesOf(records, spec, now, pricing),
     models,
     projects,

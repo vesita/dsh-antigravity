@@ -376,7 +376,10 @@
           backfilling: '统计中…',
           backfillDone: '已统计',
           backfillEmpty: '没有可统计的历史记录',
-          autoScan: '正在统计历史用量…'
+          autoScan: '正在统计历史用量…',
+          lifetime: '累计（全部时间）',
+          rangeEmptyPrefix: '该时间范围内没有记录；累计有 ',
+          rangeEmptySuffix: ' 次调用，可切到「全部」查看'
         }
       : {
           title: 'Antigravity usage',
@@ -420,7 +423,10 @@
           backfilling: 'Scanning…',
           backfillDone: 'Scanned',
           backfillEmpty: 'No history to scan',
-          autoScan: 'Scanning historical usage…'
+          autoScan: 'Scanning historical usage…',
+          lifetime: 'All time',
+          rangeEmptyPrefix: 'No calls in this window; ',
+          rangeEmptySuffix: ' recorded in total — switch to All to see them'
         }
 
     const RANGE_LABELS = zh
@@ -730,6 +736,7 @@
       }, [data, runBackfill])
 
       const overview = (data && data.overview) || null
+      const lifetime = (data && data.lifetime) || null
       const status = (data && data.status) || null
       const tokens = (overview && overview.tokens) || {}
       const cost = (overview && overview.cost) || {}
@@ -793,7 +800,10 @@
         )
       }
 
-      if (overview.requests === 0) {
+      // "Empty in this window" and "nothing ever recorded" are different facts,
+      // and reporting the second while the first is true is exactly the trap
+      // the reference implementation's fixed 24h default walks into.
+      if (overview.requests === 0 && (lifetime === null || lifetime.requests === 0)) {
         return h(
           'div',
           { style: usageStyles.wrap },
@@ -844,6 +854,32 @@
         h('div', { style: usageStyles.panelTitle }, usageCopy.title),
         toolRow,
         notice ? h('div', { style: usageStyles.meta }, notice) : null,
+        // The all-time total sits above the range-scoped cards on purpose: it
+        // answers "how much in total" without the reader having to widen the
+        // range and read the same cards back out.
+        lifetime !== null && lifetime.requests > 0
+          ? h(
+              'div',
+              { style: usageStyles.panel },
+              h(
+                'div',
+                { style: usageStyles.legend },
+                h('span', { style: usageStyles.panelTitle }, usageCopy.lifetime),
+                h('span', null, `${fmtInt(lifetime.requests)} ${usageCopy.calls}`),
+                h('span', null, `${fmtTokens(lifetime.tokens.totalTokens)} ${usageCopy.tokens}`),
+                h('span', null, fmtCost(lifetime.cost.total)),
+                h('span', { style: usageStyles.spacer }),
+                h('span', null, `${fmtClock(lifetime.firstTime)} → ${fmtClock(lifetime.lastTime)}`)
+              )
+            )
+          : null,
+        overview.requests === 0 && lifetime !== null
+          ? h(
+              'div',
+              { style: usageStyles.empty },
+              `${usageCopy.rangeEmptyPrefix}${fmtInt(lifetime.requests)}${usageCopy.rangeEmptySuffix}`
+            )
+          : null,
         status && status.enabled === false ? h('div', { style: usageStyles.empty }, usageCopy.disabled) : null,
         h(
           'div',

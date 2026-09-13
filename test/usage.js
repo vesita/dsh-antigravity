@@ -309,6 +309,25 @@ check('buildRequests 附带成本与项目标签，且限制行数', () => {
   assert.ok(buildRequests(store, DEFAULT_PRICING, { range: 'all' }).length <= 50)
 })
 
+check('快照同时给出范围内与累计两组总量', () => {
+  const scoped = buildSnapshot(store, DEFAULT_PRICING, '24h', { now: 10_000 })
+  assert.strictEqual(scoped.overview.requests, 1)
+  assert.strictEqual(scoped.lifetime.requests, 1)
+  // The widest range IS the lifetime total, so the two must never disagree.
+  const wide = buildSnapshot(store, DEFAULT_PRICING, 'all', { now: 10_000 })
+  assert.strictEqual(wide.overview.requests, wide.lifetime.requests)
+  assert.strictEqual(wide.lifetime.tokens.totalTokens, wide.overview.tokens.totalTokens)
+})
+
+check('窗口外有历史时不算「从未记录」', () => {
+  // Shift the clock past the stored call so the one-hour window is genuinely
+  // empty while the lifetime total still holds it.
+  const later = 5_000 + 3_600_000 + 1
+  const scoped = buildSnapshot(store, DEFAULT_PRICING, '1h', { now: later })
+  assert.strictEqual(scoped.overview.requests, 0)
+  assert.strictEqual(scoped.lifetime.requests, 1)
+})
+
 check('status 暴露账户门禁与上次统计时间', () => {
   const blank = buildSnapshot(store, DEFAULT_PRICING, '24h', { now: 10_000 })
   assert.strictEqual(blank.status.authenticated, true)
