@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto'
 import { DEFAULT_ENDPOINTS } from './adapter.js'
 import { MODEL_CATALOG, resolveModelSpec } from './models.js'
 import type { ModelSpec } from './models.js'
+import { toAntigravityToolSchema } from './tool-schema.js'
 import type { AntigravityCredentials } from './auth.js'
 
 /**
@@ -179,7 +180,10 @@ async function handleChatCompletions(
         functionDeclarations: body.tools.map(tool => ({
           name: tool.function?.name || tool.name,
           description: tool.function?.description || tool.description || '',
-          parameters: tool.function?.parameters || tool.parameters || { type: 'object', properties: {} }
+          // Same projection as the native adapter: one undefined keyword fails
+          // the whole request, and callers of this proxy send whatever their
+          // own tool layer produced.
+          parameters: toAntigravityToolSchema(tool.function?.parameters || tool.parameters)
         }))
       }
     ]

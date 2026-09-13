@@ -15,6 +15,7 @@ DeepSeek Harness (DSH) 的 **Google Antigravity** 模型提供商插件：原生
 | 读写 `~/.omp/agent/agent.db`，退出登录会删除 omp 的记录 | 凭据写入 `ctx.credentials`（`dsh-antigravity/google-antigravity` 记录）并镜像到 `~/.dsh/antigravity-auth.json` |
 | 每次 DSH 启动都强占 8045 端口跑代理 | OpenAI 兼容代理改为**可选**（`proxy.enabled`，默认关闭） |
 | 适配器把带 `thoughtSignature` 的普通文本误判为思考过程；`block-end` 文本错位；工具调用被 `MAX_TOKENS` 覆盖 | 只以 `part.thought === true` 判定思考；块状态机重写；工具调用优先于 `max-tokens` |
+| 工具 schema 里的 `const` 被原样透传给 Gemini 端点，**整包** 400（`Unknown name "const"`）—— DSH 自带的 `cordis_define` 就用它，于是任何带该工具的 agent 一旦路由到 Antigravity 就在首次请求上失败 | 构造请求前投影工具 schema：`const` → 单值 `enum`，剥掉端点不认的引用/文档关键字；原生适配器与 OpenAI 兼容代理共用同一投影 |
 
 ---
 
@@ -227,6 +228,7 @@ src/                      TypeScript 源码（NodeNext 风格，import 写 ./x.j
 ├── auth-flow.ts       单次 OAuth 尝试的本地回调监听（Web / flow / CLI 共用）
 ├── proxy.ts           可选 OpenAI 兼容代理
 ├── models.ts          模型目录与 id/wireId 解析
+├── tool-schema.ts     工具 JSON Schema → Antigravity functionDeclarations 方言投影
 └── bin.ts             独立 CLI（login / logout / status / refresh / proxy）
 lib/                      tsc 构建产物（git 忽略，随 npm 包发布）
 ```
@@ -248,6 +250,25 @@ lib/                      tsc 构建产物（git 忽略，随 npm 包发布）
 - `ctx.webServer.register({ kind: 'exact', path: '/dsh-antigravity/usage/…' })` — 用量 API，与登录路由共用同一 guard；
 - `ctx.get('sessions')` — 只读地用会话 header 补齐工作目录与「主 / 子代理」标记，服务缺席时降级为空。
 
+### 工具 schema 的 Gemini 方言
+
+`functionDeclarations[].parameters` 被端点当作 protobuf 消息解析：**它不忽略不认识的字段，而是整包拒绝**，返回 `400 INVALID_ARGUMENT`，且只报第一个冒犯者。所以工具 schema 里一个 JSON Schema 关键字就能让整个请求失败——即使那个工具从未被调用。
+
+逐关键字实测（`cloudcode-pa.googleapis.com`，每次请求只差一个关键字）：
+
+| 关键字 | 结果 |
+| --- | --- |
+| `const` | 400 `Unknown name "const"` |
+| `$ref` / `examples` | 400 |
+| `allOf` / `anyOf` / `oneOf` / `not` | 接受 |
+| `enum` / `pattern` / `format` / `default` | 接受 |
+| `minimum` / `maximum` / `minItems` | 接受 |
+| `additionalProperties: false` | 接受 |
+
+`const` 正是 DSH 自己会产出的关键字：`cordis_define` 的 `plugin` 参数是 `oneOf` 分支，用 `const: "new" | "existing"` 判别。因此 cordis preset 的 agent 一旦路由到 Antigravity，**首次请求就 400**，而同一份目录换到别的提供方完全正常；受影响的还有子代理——子会话继承父会话的整套工具目录。
+
+`src/tool-schema.ts` 在构造请求前遍历所有可能放 schema 的位置（`properties` / `items` / `oneOf` / `anyOf` / `allOf` / `not` / `additionalProperties`），把 `const: v` 改写成等价的一值 `enum: [v]`，丢掉 `$ref` / `$defs` / `definitions` / `$id` / `$schema` / `examples` 这些自包含参数 schema 用不到的引用与文档关键字，其余原样透传——不认识的未来关键字仍会在端点**响亮地**失败，而不是在这里被悄悄弱化。原生适配器与 OpenAI 兼容代理走同一个投影。
+
 ---
 
 ## 开发
@@ -255,14 +276,14 @@ lib/                      tsc 构建产物（git 忽略，随 npm 包发布）
 ```bash
 pnpm install
 pnpm run build             # tsc → lib/（测试与发布均针对 lib/ 产物）
-pnpm test                  # 构建后跑 126 项单元测试（74 宿主/浏览器 + 52 用量），无网络、无真实凭据
+pnpm test                  # 构建后跑 133 项单元测试（81 宿主/浏览器 + 52 用量），无网络、无真实凭据
 pnpm run test:types        # 仅类型检查（Host 半 + 浏览器半两份 tsconfig）
 pnpm pack                  # prepack 会自动 build，产物只含 lib/
 ```
 
 > 改了源码后必须重新构建：运行中的 DSH 与 `dsh list` 消费的是 `lib/` 而不是 `src/`。
 
-测试覆盖：模型解析、凭据记录封装、OAuth URL、请求构造、SSE 解析、用量映射、Cordis 注册（断言目录条目落在 `llm-antigravity` 而非 `llm-pi-ai`）、浏览器半插槽注册；用量侧另有纯函数口径（词元桶 / 成本 / 缓存节省 / 分桶 / 分组 / 百分位）、采集插桩的成功-失败-中止三条路径、SQLite 幂等写入与窗口查询、快照聚合与行数上限、账户门禁与自动统计的触发条件。
+测试覆盖：模型解析、凭据记录封装、OAuth URL、请求构造、工具 schema 投影（`const` / 引用关键字 / 接受关键字 / 缺失 schema 兜底 / `buildRequest` 回归）、SSE 解析、用量映射、Cordis 注册（断言目录条目落在 `llm-antigravity` 而非 `llm-pi-ai`）、浏览器半插槽注册；用量侧另有纯函数口径（词元桶 / 成本 / 缓存节省 / 分桶 / 分组 / 百分位）、采集插桩的成功-失败-中止三条路径、SQLite 幂等写入与窗口查询、快照聚合与行数上限、账户门禁与自动统计的触发条件。
 
 ---
 

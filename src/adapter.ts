@@ -17,6 +17,7 @@ import type {
 } from '@deepseek-ai/dsh-llm'
 import { MODEL_CATALOG, REASONING_EFFORTS, modelInfoOf, resolveModelSpec } from './models.js'
 import type { ModelSpec } from './models.js'
+import { toAntigravityToolSchema } from './tool-schema.js'
 import type { AntigravityCredentials } from './auth.js'
 
 /**
@@ -403,7 +404,9 @@ export async function buildRequest(
         functionDeclarations: options.tools.map(tool => ({
           name: tool.name,
           description: tool.description || '',
-          parameters: tool.parameters || { type: 'object', properties: {} }
+          // The endpoint rejects the whole request over one undefined keyword, so
+          // every declaration is projected before it goes on the wire.
+          parameters: toAntigravityToolSchema(tool.parameters)
         }))
       }
     ]

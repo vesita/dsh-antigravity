@@ -14,6 +14,7 @@ import {
   writeAuthFile
 } from '../lib/auth.js'
 import { MODEL_CATALOG, resolveModelSpec } from '../lib/models.js'
+import { toAntigravityToolSchema } from '../lib/tool-schema.js'
 import antigravityPlugin from '../lib/index.js'
 
 /**
@@ -140,6 +141,96 @@ await check('thinking config carries the requested level', () => {
 })
 await check('tools are declared', () => {
   assert.strictEqual(built.tools[0].functionDeclarations[0].name, 'read')
+})
+
+console.log('# 3.1 Gemini 工具 schema 投影（const / $ref / examples）')
+await check('const becomes a one-value enum', () => {
+  assert.deepStrictEqual(toAntigravityToolSchema({ type: 'string', const: 'new' }), { type: 'string', enum: ['new'] })
+})
+await check('nested consts are projected wherever a schema can sit', () => {
+  const projected = toAntigravityToolSchema({
+    type: 'object',
+    properties: {
+      plugin: {
+        oneOf: [
+          { type: 'object', properties: { kind: { const: 'new' } } },
+          { type: 'object', properties: { kind: { const: 'existing' } } }
+        ]
+      },
+      list: { type: 'array', items: { const: 7 } }
+    }
+  })
+  const branches = projected.properties.plugin.oneOf
+  assert.deepStrictEqual(branches[0].properties.kind, { enum: ['new'] })
+  assert.deepStrictEqual(branches[1].properties.kind, { enum: ['existing'] })
+  assert.deepStrictEqual(projected.properties.list.items, { enum: [7] })
+  assert.strictEqual(JSON.stringify(projected).includes('"const"'), false)
+})
+await check('a const merges into an existing enum without duplicating', () => {
+  assert.deepStrictEqual(toAntigravityToolSchema({ const: 'a', enum: ['a', 'b'] }).enum, ['a', 'b'])
+  assert.deepStrictEqual(toAntigravityToolSchema({ const: 'c', enum: ['a', 'b'] }).enum, ['a', 'b', 'c'])
+})
+await check('reference and document keywords are dropped', () => {
+  const projected = toAntigravityToolSchema({
+    $ref: '#/$defs/x',
+    $defs: { x: { type: 'string' } },
+    definitions: { y: { type: 'string' } },
+    $schema: 'https://json-schema.org/draft/2020-12/schema',
+    examples: ['x'],
+    type: 'object'
+  })
+  assert.deepStrictEqual(projected, { type: 'object' })
+})
+await check('accepted keywords survive unchanged', () => {
+  const schema = {
+    type: 'object',
+    required: ['p'],
+    additionalProperties: false,
+    properties: {
+      p: { type: 'string', pattern: '^a', format: 'date', default: 'a' },
+      n: { type: 'number', minimum: 1, maximum: 9 },
+      l: { type: 'array', items: { type: 'string' }, minItems: 1 },
+      any: { anyOf: [{ type: 'string' }, { type: 'number' }] },
+      none: { not: { type: 'string' } }
+    }
+  }
+  assert.deepStrictEqual(toAntigravityToolSchema(schema), schema)
+})
+await check('a missing or unusable schema falls back to an open object', () => {
+  assert.deepStrictEqual(toAntigravityToolSchema(undefined), { type: 'object', properties: {} })
+  assert.deepStrictEqual(toAntigravityToolSchema('not a schema'), { type: 'object', properties: {} })
+  assert.deepStrictEqual(toAntigravityToolSchema(null), { type: 'object', properties: {} })
+})
+await check('buildRequest ships a const-free declaration (regression: 400 Unknown name "const")', async () => {
+  const request = await buildRequest(
+    {
+      provider: 'google-antigravity',
+      model: 'gemini-3.8-flash',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+      tools: [
+        {
+          name: 'cordis_define',
+          description: 'define a package',
+          parameters: {
+            type: 'object',
+            properties: {
+              plugin: {
+                oneOf: [
+                  { type: 'object', additionalProperties: false, properties: { kind: { type: 'string', const: 'new' } } },
+                  { type: 'object', additionalProperties: false, properties: { kind: { type: 'string', const: 'existing' } } }
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    resolveModelSpec('gemini-3.8-flash')
+  )
+  const parameters = request.tools[0].functionDeclarations[0].parameters
+  assert.strictEqual(JSON.stringify(parameters).includes('"const"'), false)
+  assert.deepStrictEqual(parameters.properties.plugin.oneOf[0].properties.kind.enum, ['new'])
+  assert.deepStrictEqual(parameters.properties.plugin.oneOf[1].properties.kind.enum, ['existing'])
 })
 
 console.log('# 4. SSE 解析与用量映射')
