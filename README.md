@@ -97,6 +97,70 @@ dsh-antigravity proxy --port 8045
 
 ---
 
+## 用量统计
+
+插件自带一套**只统计自己这条路由**的用量账本：每次 `google-antigravity` 调用结束后，
+适配器把词元数、首字延迟（TTFT）、总时长、终止原因交给采集器，落进
+`~/.dsh/antigravity-usage.db`（`node:sqlite`，0600，不引入任何依赖）。
+
+**只有装了账户的人才会看到这一页。** `settings.section` 没有逐项的可见性开关，所以门禁就是
+注册本身：浏览器半启动时探测一次宿主（设置标记或已存凭据），只有拿到「已登录」才把
+**设置 → 用量统计** 注册进设置导航；没账户的安装看不到它，而不是看到一个永远空着的页面。
+
+打开这一页就会**自动统计**（见下），你不需要先按任何按钮：
+
+| 区块 | 内容 |
+| --- | --- |
+| 时间范围 | `1h` / `24h` / `7d` / `30d` / `90d` / 全部（默认 24h） |
+| 概览卡 | 请求数、总词元、缓存命中率与节省、等价成本、输入/输出/缓存词元、平均 TTFT、平均时长、输出速率 |
+| 请求趋势 | 按桶的请求数折线 + 失败数折线（1h→5 分钟、24h→小时、更长→天） |
+| 按模型 | 请求、四类词元、缓存率、TTFT、等价成本 |
+| 按项目 | 按会话工作目录聚合，展示末两级路径作为短标签 |
+| 最近请求 | 最近 12 条：时间、模型、词元、时长、等价成本、成功/失败/中止 |
+
+统计口径（写进代码注释并由单元测试约束）：
+
+- 词元四桶**互不重叠**（`inputTokens` 不含缓存命中），`totalTokens` 恒等于四者之和；
+- `aborted`（用户主动中断）**不算失败**，只有 `error` 计入错误率；
+- 首字延迟取「请求开始 → 第一个内容增量」，`usage` / `finish` 这类记账块不启动计时；
+- 缓存命中率 = `cacheRead / (input + cacheRead)`；
+- 成本是**按内置单价的 API 等价估算**，不是账单（Antigravity 是订阅制）。内置单价来自
+  Oh My Pi 的内嵌定价表，并用本机真实账单反推的隐含单价交叉验证过；
+- 日桶按**本地时区**对齐（参考实现用 UTC，那会把一天切在早上 8 点）。
+
+数据只落在本机；用量面板的 HTTP 路由与登录路由共用同一套回环校验（Host/Origin +
+浏览器会话），不联网、不外发。
+
+### 打开即统计历史
+
+实时采集只看得到**装上插件之后**的调用，所以刚装好时历史上是一片空白。打开面板本身
+就是「把历史算出来」的触发：**每次打开都自动扫一次** `~/.dsh/sessions/`——DSH 每个
+`assistant/message` 事件都带着 provider 上报的 `usage`，一次扫描就能把过去翻出来。
+面板上的 **重新统计** 按钮用于不离开页面时强制再扫一次。
+
+之所以能每次打开都扫，是因为扫描按**文件修订**做增量：每个会话文件的
+`(mtime, size)` 记在 `usage_files` 表里，没变动的文件只做一次 `stat` 就跳过，根本不解压。
+实测（本机，101 个会话文件 / 72,597 个事件）：
+
+| 扫描 | 耗时 | 解压文件 | 解析事件 |
+| --- | --- | --- | --- |
+| 首次 | 2067 ms | 101 | 72,597 |
+| 再次 | **4 ms** | 0（全部跳过） | 0 |
+
+匹配到 176 条历史 Antigravity 调用。写入本身也是幂等的（键为 `会话:事件序号`），
+重复扫描不会重复计数。
+
+两点口径要说明，代码里也写死了：
+
+- 会话日志**不保存**首字延迟与总耗时，统计出的历史行这两列是空的（`—`）；
+- 日志也不保存终止原因，历史行一律计为成功。
+
+日志是多帧 zstd（`session.v3.jsonl.zstd`），Node 自带的 `zstdDecompress` 只读第一帧，
+所以统计会调用系统的 `zstd` 命令；它不在 PATH 时会明确报错而不是猜。
+单文件解压超过 128 MB 会被跳过并记录在返回的 `failed` 里，不影响其余文件。
+
+---
+
 ## 设置项（`~/.dsh/settings.yaml` → `llm-antigravity`）
 
 | 字段 | 默认 | 说明 |
@@ -110,6 +174,9 @@ dsh-antigravity proxy --port 8045
 | `reasoningEffort` | `high` | `off` / `low` / `high`；`low`/`high` 仅对 `gemini-3*` 发送 `thinkingLevel` |
 | `retryPolicy` | `{ mode: normal, maxRetries: 3 }` | 透传 DSH 重试策略 |
 | `proxy` | `{ enabled: false, host: 127.0.0.1, port: 8045 }` | 可选 OpenAI 兼容代理 |
+| `usage.enabled` | `true` | 是否记录用量；关闭后不再写库，已有数据保留 |
+| `usage.retentionDays` | `0` | 只保留最近 N 天，`0` = 全部保留；在插件加载与设置变更时清理 |
+| `usage.pricing` | 内置 11 个模型单价 | 覆盖单价表，形如 `[{ model: gemini-3.8-flash, input: 0.75, output: 3.75, cacheRead: 0.075, cacheWrite: 0 }]`，单位 USD / 1M tokens |
 
 环境变量覆盖（优先级高于内置客户端，低于设置项）：
 
@@ -138,15 +205,20 @@ export DSH_ANTIGRAVITY_CLIENT_SECRET=...
 
 ```
 src/                      TypeScript 源码（NodeNext 风格，import 写 ./x.js）
-├── index.ts      Host 插件：自有 settings 命名空间、原生适配器注册、
-│                 authorization 登录 flow、/dsh-antigravity/auth/* 回环路由、可选代理
-├── client.ts     浏览器半：settings.models.provider-card 卡片内登录 UI
-├── adapter.ts    原生 LlmAdapter：请求构造 + SSE → DSH StreamChunk
-├── auth.ts       OAuth 端点、客户端解析、凭据分层读写、刷新
-├── auth-flow.ts  单次 OAuth 尝试的本地回调监听（Web / flow / CLI 共用）
-├── proxy.ts      可选 OpenAI 兼容代理
-├── models.ts     模型目录与 id/wireId 解析
-└── bin.ts        独立 CLI（login / logout / status / refresh / proxy）
+├── index.ts           Host 插件：自有 settings 命名空间、原生适配器注册、
+│                      authorization 登录 flow、/dsh-antigravity/{auth,usage}/* 回环路由、可选代理
+├── client.ts          浏览器半：提供方卡片内登录 UI + 设置页「用量统计」面板
+├── adapter.ts         原生 LlmAdapter：请求构造 + SSE → DSH StreamChunk，并观测每次调用
+├── usage-model.ts     纯函数用量模型：词元桶、成本、时间窗、聚合、分桶、分组
+├── usage-store.ts     node:sqlite 持久化：幂等写入、窗口查询、统计、保留期清理
+├── usage-collector.ts 把观测到的调用补上会话事实（目录 / 主-子代理）后落库
+├── usage-routes.ts    用量 API：快照 / 明细 / 状态 / 清理 / 历史导入
+├── usage-backfill.ts  从会话日志（多帧 zstd）回溯历史调用
+├── auth.ts            OAuth 端点、客户端解析、凭据分层读写、刷新
+├── auth-flow.ts       单次 OAuth 尝试的本地回调监听（Web / flow / CLI 共用）
+├── proxy.ts           可选 OpenAI 兼容代理
+├── models.ts          模型目录与 id/wireId 解析
+└── bin.ts             独立 CLI（login / logout / status / refresh / proxy）
 lib/                      tsc 构建产物（git 忽略，随 npm 包发布）
 ```
 
@@ -162,7 +234,10 @@ lib/                      tsc 构建产物（git 忽略，随 npm 包发布）
 - `ctx.settings.installSection(ctx, 'llm-antigravity', Config, ...)` — 自有设置命名空间；
 - `ctx.authorization.registerFlow({ key, label, methods, run })` — 无头/ACP 登录；
 - `ctx.webServer.register({ kind: 'exact', path: '/dsh-antigravity/auth/...' })` — 浏览器登录回环路由（经 `ctx.connection.requestRejection` 校验）；
-- `settings.models.provider-card` 键 `llm-antigravity` — 卡片扩展区。
+- `settings.models.provider-card` 键 `llm-antigravity` — 卡片扩展区；
+- `settings.section` id `antigravity-usage` — 设置页「用量统计」；
+- `ctx.webServer.register({ kind: 'exact', path: '/dsh-antigravity/usage/…' })` — 用量 API，与登录路由共用同一 guard；
+- `ctx.get('sessions')` — 只读地用会话 header 补齐工作目录与「主 / 子代理」标记，服务缺席时降级为空。
 
 ---
 
@@ -171,14 +246,14 @@ lib/                      tsc 构建产物（git 忽略，随 npm 包发布）
 ```bash
 pnpm install
 pnpm run build             # tsc → lib/（测试与发布均针对 lib/ 产物）
-pnpm test                  # 构建后跑 37 项单元测试，无网络、无真实凭据
+pnpm test                  # 构建后跑 124 项单元测试（74 宿主/浏览器 + 50 用量），无网络、无真实凭据
 pnpm run test:types        # 仅类型检查（Host 半 + 浏览器半两份 tsconfig）
 pnpm pack                  # prepack 会自动 build，产物只含 lib/
 ```
 
 > 改了源码后必须重新构建：运行中的 DSH 与 `dsh list` 消费的是 `lib/` 而不是 `src/`。
 
-测试覆盖：模型解析、凭据记录封装、OAuth URL、请求构造、SSE 解析、用量映射、Cordis 注册（断言目录条目落在 `llm-antigravity` 而非 `llm-pi-ai`）、浏览器半插槽注册。
+测试覆盖：模型解析、凭据记录封装、OAuth URL、请求构造、SSE 解析、用量映射、Cordis 注册（断言目录条目落在 `llm-antigravity` 而非 `llm-pi-ai`）、浏览器半插槽注册；用量侧另有纯函数口径（词元桶 / 成本 / 缓存节省 / 分桶 / 分组 / 百分位）、采集插桩的成功-失败-中止三条路径、SQLite 幂等写入与窗口查询、快照聚合与行数上限、账户门禁与自动统计的触发条件。
 
 ---
 
@@ -188,6 +263,7 @@ pnpm pack                  # prepack 会自动 build，产物只含 lib/
 - 回环路由 `/dsh-antigravity/auth/*` 仅在 DSH 的 Web 载体下注册，并经过 Host/Origin 与浏览器认证校验；无 `connection` 服务时不注册。
 - OAuth 回调监听 `127.0.0.1:51121` 只在一次登录进行中存在，且无法被本机其他进程利用：回调必须回显本次尝试的 `state`，否则被忽略；任何中止路径都不会产生未处理的 rejection（DSH 的 fail-loud 处理器会因此退出进程）。
 - 凭据文件权限为 0600，且不会写入任何第三方应用的数据库。
+- 用量库 `~/.dsh/antigravity-usage.db` 权限 0600，只记录本插件这条路由的调用元数据（模型、词元数、耗时、停止原因），不含提示词与响应正文；用量 API 与登录路由共用同一套回环校验。
 
 ## License
 

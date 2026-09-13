@@ -321,6 +321,584 @@
       )
     }
 
+    // -----------------------------------------------------------------------
+    // Usage panel — rendered as its own Settings page.
+    //
+    // The panel is a reader of the host's `/dsh-antigravity/usage` routes; all
+    // arithmetic happens on the host, so the browser only formats. Charts are
+    // hand-drawn SVG: the browser half is delivered untranspiled and may only
+    // require what DSH publishes, so pulling in a charting library is not an
+    // option worth its weight for two polylines.
+    // -----------------------------------------------------------------------
+    const USAGE_ROUTE = '/dsh-antigravity/usage'
+    const USAGE_REFRESH_MS = 30_000
+
+    const usageCopy = zh
+      ? {
+          title: 'Antigravity 用量',
+          requests: '请求数',
+          totalTokens: '总词元',
+          cacheRate: '缓存命中率',
+          cost: '等价成本',
+          input: '输入词元',
+          output: '输出词元',
+          cacheRead: '缓存读取词元',
+          avgTtft: '平均 TTFT',
+          avgDuration: '平均时长',
+          throughput: '输出速率',
+          errors: '错误率',
+          trend: '请求趋势',
+          byModel: '按模型',
+          byProject: '按项目',
+          recent: '最近请求',
+          refresh: '刷新',
+          refreshing: '刷新中…',
+          loading: '加载中…',
+          noData: '暂无数据',
+          model: '模型',
+          project: '项目',
+          calls: '请求',
+          tokens: '词元',
+          ttft: 'TTFT',
+          duration: '时长',
+          status: '状态',
+          time: '时间',
+          empty: '还没有记录到 Google Antigravity 调用。用这个提供商跑一次对话后，这里就会出现数据。',
+          costHint: '按内置单价估算的 API 等价价值，不是实际账单（Antigravity 是订阅制）。',
+          recorded: '已记录',
+          span: '跨度',
+          disabled: '用量记录已在设置中关闭',
+          ok: '成功',
+          failed: '失败',
+          aborted: '已中止',
+          note: '日桶按本地时区对齐。统计出的历史记录没有延迟与停止原因（会话日志不保存），一律计为成功',
+          backfill: '重新统计',
+          backfilling: '统计中…',
+          backfillDone: '已统计',
+          backfillEmpty: '没有可统计的历史记录',
+          autoScan: '正在统计历史用量…'
+        }
+      : {
+          title: 'Antigravity usage',
+          requests: 'Requests',
+          totalTokens: 'Total tokens',
+          cacheRate: 'Cache rate',
+          cost: 'API-equivalent cost',
+          input: 'Input tokens',
+          output: 'Output tokens',
+          cacheRead: 'Cache reads',
+          avgTtft: 'Avg TTFT',
+          avgDuration: 'Avg duration',
+          throughput: 'Output rate',
+          errors: 'Error rate',
+          trend: 'Request trend',
+          byModel: 'By model',
+          byProject: 'By project',
+          recent: 'Recent requests',
+          refresh: 'Refresh',
+          refreshing: 'Refreshing…',
+          loading: 'Loading…',
+          noData: 'No data',
+          model: 'Model',
+          project: 'Project',
+          calls: 'Calls',
+          tokens: 'Tokens',
+          ttft: 'TTFT',
+          duration: 'Duration',
+          status: 'Status',
+          time: 'Time',
+          empty: 'No Google Antigravity calls recorded yet. Run one conversation on this provider and data appears here.',
+          costHint: 'Estimated API-equivalent value at the built-in prices, not a bill (Antigravity is subscription-billed).',
+          recorded: 'Recorded',
+          span: 'Span',
+          disabled: 'Usage recording is turned off in settings',
+          ok: 'Success',
+          failed: 'Failed',
+          aborted: 'Aborted',
+          note: 'Day buckets are aligned to local time. Scanned history carries no latency or stop reason (session logs do not keep them) and counts as successful',
+          backfill: 'Rescan history',
+          backfilling: 'Scanning…',
+          backfillDone: 'Scanned',
+          backfillEmpty: 'No history to scan',
+          autoScan: 'Scanning historical usage…'
+        }
+
+    const RANGE_LABELS = zh
+      ? { '1h': '1 小时', '24h': '24 小时', '7d': '7 天', '30d': '30 天', '90d': '90 天', all: '全部' }
+      : { '1h': '1h', '24h': '24h', '7d': '7d', '30d': '30d', '90d': '90d', all: 'All' }
+
+    async function getJson(path: string, init?: any): Promise<any> {
+      const response = await fetch(path, Object.assign({ headers: { accept: 'application/json' } }, init))
+      let payload: any = {}
+      try {
+        payload = await response.json()
+      } catch {
+        payload = {}
+      }
+      if (!response.ok) throw new Error((payload && payload.error) || `HTTP ${response.status}`)
+      return payload
+    }
+
+    function fmtInt(value: any): string {
+      const n = typeof value === 'number' && isFinite(value) ? value : 0
+      return n.toLocaleString(zh ? 'zh-CN' : 'en-US')
+    }
+
+    function fmtTokens(value: any): string {
+      const n = typeof value === 'number' && isFinite(value) ? value : 0
+      if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1)}M`
+      if (n >= 1_000) return `${(n / 1_000).toFixed(n >= 100_000 ? 0 : 1)}K`
+      return String(Math.round(n))
+    }
+
+    function fmtCost(value: any): string {
+      const n = typeof value === 'number' && isFinite(value) ? value : 0
+      if (n === 0) return '$0'
+      if (n < 0.01) return `$${n.toFixed(4)}`
+      if (n < 1) return `$${n.toFixed(3)}`
+      return `$${n.toFixed(2)}`
+    }
+
+    function fmtMs(value: any): string {
+      if (typeof value !== 'number' || !isFinite(value) || value < 0) return '—'
+      if (value < 1000) return `${Math.round(value)} ms`
+      return `${(value / 1000).toFixed(1)} s`
+    }
+
+    function fmtPct(value: any): string {
+      const n = typeof value === 'number' && isFinite(value) ? value : 0
+      return `${(n * 100).toFixed(1)}%`
+    }
+
+    function fmtClock(time: any): string {
+      if (typeof time !== 'number' || !isFinite(time) || time <= 0) return '—'
+      const d = new Date(time)
+      const pad = (n: number) => String(n).padStart(2, '0')
+      return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+    }
+
+    function stopReasonLabel(reason: any): string {
+      const value = String(reason || '')
+      if (value === 'error') return usageCopy.failed
+      if (value === 'aborted') return usageCopy.aborted
+      return usageCopy.ok
+    }
+
+    function stopReasonColor(reason: any): string {
+      const value = String(reason || '')
+      if (value === 'error') return 'var(--dsw-alias-state-error-primary)'
+      if (value === 'aborted') return 'var(--dsw-alias-state-warn-primary)'
+      return 'var(--dsw-alias-state-success-primary)'
+    }
+
+    const usageStyles = {
+      wrap: { display: 'flex', flexDirection: 'column', gap: '14px', padding: '4px 0' },
+      toolbar: { display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' },
+      spacer: { flex: '1 1 auto' },
+      meta: { fontSize: '12px', lineHeight: '18px', color: 'var(--dsw-alias-label-secondary)' },
+      grid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(132px, 1fr))', gap: '8px' },
+      card: {
+        border: '1px solid var(--dsw-alias-border-l1)',
+        background: 'var(--dsw-alias-bg-layer-1)',
+        borderRadius: '8px',
+        padding: '10px 12px',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '2px',
+        minWidth: 0
+      },
+      cardLabel: { fontSize: '12px', lineHeight: '16px', color: 'var(--dsw-alias-label-secondary)' },
+      cardValue: { fontSize: '19px', lineHeight: '26px', fontWeight: 600, color: 'var(--dsw-alias-label-primary)' },
+      cardHint: { fontSize: '11px', lineHeight: '15px', color: 'var(--dsw-alias-label-secondary)', opacity: '0.8' },
+      panel: {
+        border: '1px solid var(--dsw-alias-border-l1)',
+        background: 'var(--dsw-alias-bg-layer-1)',
+        borderRadius: '8px',
+        padding: '10px 12px',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '8px'
+      },
+      panelTitle: { fontSize: '12px', lineHeight: '18px', fontWeight: 600, color: 'var(--dsw-alias-label-primary)' },
+      chart: { display: 'block', width: '100%' },
+      legend: { display: 'flex', gap: '12px', fontSize: '11px', color: 'var(--dsw-alias-label-secondary)' },
+      dot: { display: 'inline-block', width: '8px', height: '8px', borderRadius: '50%', marginRight: '4px' },
+      tableWrap: { overflowX: 'auto' },
+      table: { width: '100%', borderCollapse: 'collapse', fontSize: '12px' },
+      th: {
+        textAlign: 'left',
+        padding: '6px 8px',
+        color: 'var(--dsw-alias-label-secondary)',
+        fontWeight: 500,
+        borderBottom: '1px solid var(--dsw-alias-border-l1)',
+        whiteSpace: 'nowrap'
+      },
+      td: {
+        padding: '6px 8px',
+        color: 'var(--dsw-alias-label-primary)',
+        borderBottom: '1px solid var(--dsw-alias-border-l1)',
+        whiteSpace: 'nowrap'
+      },
+      right: { textAlign: 'right' },
+      mono: { fontVariantNumeric: 'tabular-nums' },
+      empty: { fontSize: '12px', lineHeight: '18px', color: 'var(--dsw-alias-label-secondary)', padding: '8px 0' },
+      error: { fontSize: '12px', lineHeight: '18px', color: 'var(--dsw-alias-state-error-primary)', margin: 0 }
+    }
+
+    function MetricCard(props: any) {
+      return h(
+        'div',
+        { style: usageStyles.card },
+        h('div', { style: usageStyles.cardLabel }, props.label),
+        h('div', { style: usageStyles.cardValue }, props.value),
+        props.hint ? h('div', { style: usageStyles.cardHint }, props.hint) : null
+      )
+    }
+
+    function UsageTable(props: any) {
+      const columns = props.columns || []
+      const rows = props.rows || []
+      if (rows.length === 0) return h('div', { style: usageStyles.empty }, props.empty || usageCopy.noData)
+      return h(
+        'div',
+        { style: usageStyles.tableWrap },
+        h(
+          'table',
+          { style: usageStyles.table },
+          h(
+            'thead',
+            null,
+            h(
+              'tr',
+              null,
+              columns.map(column =>
+                h(
+                  'th',
+                  {
+                    key: column.key,
+                    style: Object.assign({}, usageStyles.th, column.align === 'right' ? usageStyles.right : null)
+                  },
+                  column.label
+                )
+              )
+            )
+          ),
+          h(
+            'tbody',
+            null,
+            rows.map((row: any, index: number) =>
+              h(
+                'tr',
+                { key: index },
+                columns.map(column =>
+                  h(
+                    'td',
+                    {
+                      key: column.key,
+                      style: Object.assign(
+                        {},
+                        usageStyles.td,
+                        usageStyles.mono,
+                        column.align === 'right' ? usageStyles.right : null
+                      )
+                    },
+                    column.render ? column.render(row) : String(row[column.key] === undefined ? '' : row[column.key])
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+    }
+
+    /**
+     * Two polylines over the same bucket axis: request volume, with failures
+     * drawn in the error color so a bad window is visible without reading axes.
+     */
+    function UsageTrend(props: any) {
+      const points = Array.isArray(props.points) ? props.points : []
+      if (points.length === 0) return h('div', { style: usageStyles.empty }, usageCopy.noData)
+      const width = 600
+      const height = 110
+      const pad = 6
+      const maxRequests = Math.max(1, ...points.map((p: any) => Number(p.requests) || 0))
+      const step = points.length > 1 ? (width - pad * 2) / (points.length - 1) : 0
+      const xOf = (index: number) => pad + index * step
+      const yOf = (value: number) => height - pad - (value / maxRequests) * (height - pad * 2)
+      const pathOf = (key: string) =>
+        points
+          .map((point: any, index: number) => `${index === 0 ? 'M' : 'L'}${xOf(index).toFixed(1)},${yOf(Number(point[key]) || 0).toFixed(1)}`)
+          .join(' ')
+      const first = points[0]
+      const last = points[points.length - 1]
+      return h(
+        'div',
+        null,
+        h(
+          'svg',
+          { viewBox: `0 0 ${width} ${height}`, width: '100%', height: '110px', preserveAspectRatio: 'none', style: usageStyles.chart },
+          h('path', { d: pathOf('requests'), fill: 'none', stroke: 'var(--dsw-alias-brand-primary)', strokeWidth: '2' }),
+          h('path', { d: pathOf('errors'), fill: 'none', stroke: 'var(--dsw-alias-state-error-primary)', strokeWidth: '1.5' })
+        ),
+        h(
+          'div',
+          { style: usageStyles.legend },
+          h('span', null, h('i', { style: Object.assign({}, usageStyles.dot, { background: 'var(--dsw-alias-brand-primary)' }) }), `${usageCopy.requests} (max ${fmtInt(maxRequests)})`),
+          h('span', null, h('i', { style: Object.assign({}, usageStyles.dot, { background: 'var(--dsw-alias-state-error-primary)' }) }), usageCopy.errors),
+          h('span', { style: usageStyles.spacer }),
+          h('span', null, `${fmtClock(first.time)} → ${fmtClock(last.time)}`)
+        )
+      )
+    }
+
+    /** Settings → usage page. Reads the host routes; holds no accounting logic. */
+    function AntigravityUsagePanel(props: any) {
+      const [range, setRange] = React.useState('24h')
+      const [data, setData] = React.useState(null)
+      const [error, setError] = React.useState(null)
+      const [loading, setLoading] = React.useState(false)
+      const [backfilling, setBackfilling] = React.useState(false)
+      const [notice, setNotice] = React.useState(null)
+
+      const load = React.useCallback(
+        async (target?: string) => {
+          const next = target || range
+          setLoading(true)
+          try {
+            const payload = await getJson(`${USAGE_ROUTE}/overview?range=${encodeURIComponent(next)}`)
+            setData(payload)
+            setError(null)
+          } catch (cause) {
+            setError(cause.message)
+          } finally {
+            setLoading(false)
+          }
+        },
+        [range]
+      )
+
+      React.useEffect(() => {
+        load(range)
+      }, [range])
+
+      React.useEffect(() => {
+        const timer = setInterval(() => {
+          load()
+        }, USAGE_REFRESH_MS)
+        return () => clearInterval(timer)
+      }, [load])
+
+      const runBackfill = React.useCallback(
+        async (auto?: boolean) => {
+          setBackfilling(true)
+          setNotice(auto === true ? usageCopy.autoScan : null)
+          try {
+            const result = await getJson(`${USAGE_ROUTE}/backfill`, { method: 'POST' })
+            setNotice(
+              result && Number(result.imported) > 0
+                ? `${usageCopy.backfillDone} ${fmtInt(result.imported)}`
+                : auto === true
+                  ? null
+                  : usageCopy.backfillEmpty
+            )
+          } catch (cause) {
+            setNotice(`${usageCopy.backfill}: ${cause.message}`)
+          } finally {
+            setBackfilling(false)
+            load()
+          }
+        },
+        [load]
+      )
+
+      /** One automatic scan per panel mount. */
+      const autoScanned = React.useRef(false)
+
+      /**
+       * Opening the panel is itself the request to account for history, so it
+       * happens on every open rather than behind a button or a cooldown. That
+       * stays cheap because the host skips every session file whose revision
+       * has not changed — the rescan normally decompresses nothing at all.
+       */
+      React.useEffect(() => {
+        if (data === null || autoScanned.current) return
+        const snapshot = data.status
+        if (!snapshot || snapshot.backfill !== true || snapshot.authenticated !== true) return
+        autoScanned.current = true
+        runBackfill(true)
+      }, [data, runBackfill])
+
+      const overview = (data && data.overview) || null
+      const status = (data && data.status) || null
+      const tokens = (overview && overview.tokens) || {}
+      const cost = (overview && overview.cost) || {}
+
+      const rangeButtons = ((data && data.ranges) || ['1h', '24h', '7d', '30d', '90d', 'all']).map((value: string) =>
+        h(
+          Button,
+          {
+            key: value,
+            variant: value === range ? 'primary' : 'outline',
+            size: 'sm',
+            disabled: loading,
+            onClick: () => setRange(value)
+          },
+          (RANGE_LABELS as any)[value] || value
+        )
+      )
+
+      const toolRow = h(
+        'div',
+        { style: usageStyles.toolbar },
+        rangeButtons,
+        h('span', { style: usageStyles.spacer }),
+        status
+          ? h(
+              'span',
+              { style: usageStyles.meta },
+              `${usageCopy.recorded} ${fmtInt(status.total)} · ${usageCopy.span} ${fmtClock(status.firstTime)} → ${fmtClock(status.lastTime)}`
+            )
+          : null,
+        status && status.backfill === true
+          ? h(
+              Button,
+              { variant: 'outline', size: 'sm', disabled: backfilling || loading, onClick: runBackfill },
+              backfilling ? usageCopy.backfilling : usageCopy.backfill
+            )
+          : null,
+        h(
+          Button,
+          { variant: 'outline', size: 'sm', disabled: loading, onClick: () => load() },
+          loading ? usageCopy.refreshing : usageCopy.refresh
+        )
+      )
+
+      if (error) {
+        return h(
+          'div',
+          { style: usageStyles.wrap },
+          h('div', { style: usageStyles.panelTitle }, usageCopy.title),
+          toolRow,
+          h('p', { style: usageStyles.error }, error)
+        )
+      }
+
+      if (data === null) {
+        return h(
+          'div',
+          { style: usageStyles.wrap },
+          h('div', { style: usageStyles.panelTitle }, usageCopy.title),
+          h('div', { style: usageStyles.empty }, usageCopy.loading)
+        )
+      }
+
+      if (overview.requests === 0) {
+        return h(
+          'div',
+          { style: usageStyles.wrap },
+          h('div', { style: usageStyles.panelTitle }, usageCopy.title),
+          toolRow,
+          notice ? h('div', { style: usageStyles.meta }, notice) : null,
+          h('div', { style: usageStyles.empty }, usageCopy.empty)
+        )
+      }
+
+      const modelColumns = [
+        { key: 'model', label: usageCopy.model, render: (row: any) => row.label },
+        { key: 'calls', label: usageCopy.calls, align: 'right', render: (row: any) => fmtInt(row.overview.requests) },
+        { key: 'input', label: usageCopy.input, align: 'right', render: (row: any) => fmtTokens(row.overview.tokens.inputTokens) },
+        { key: 'output', label: usageCopy.output, align: 'right', render: (row: any) => fmtTokens(row.overview.tokens.outputTokens) },
+        { key: 'cache', label: usageCopy.cacheRead, align: 'right', render: (row: any) => fmtTokens(row.overview.tokens.cacheReadTokens) },
+        { key: 'rate', label: usageCopy.cacheRate, align: 'right', render: (row: any) => fmtPct(row.overview.cacheRate) },
+        { key: 'ttft', label: usageCopy.ttft, align: 'right', render: (row: any) => fmtMs(row.overview.avgTtftMs) },
+        { key: 'cost', label: usageCopy.cost, align: 'right', render: (row: any) => fmtCost(row.overview.cost.total) }
+      ]
+
+      const projectColumns = [
+        { key: 'project', label: usageCopy.project, render: (row: any) => row.label },
+        { key: 'calls', label: usageCopy.calls, align: 'right', render: (row: any) => fmtInt(row.overview.requests) },
+        { key: 'tokens', label: usageCopy.tokens, align: 'right', render: (row: any) => fmtTokens(row.overview.tokens.totalTokens) },
+        { key: 'rate', label: usageCopy.cacheRate, align: 'right', render: (row: any) => fmtPct(row.overview.cacheRate) },
+        { key: 'errors', label: usageCopy.errors, align: 'right', render: (row: any) => fmtPct(row.overview.errorRate) },
+        { key: 'cost', label: usageCopy.cost, align: 'right', render: (row: any) => fmtCost(row.overview.cost.total) }
+      ]
+
+      const recentColumns = [
+        { key: 'time', label: usageCopy.time, render: (row: any) => fmtClock(row.time) },
+        { key: 'model', label: usageCopy.model, render: (row: any) => row.model },
+        { key: 'tokens', label: usageCopy.tokens, align: 'right', render: (row: any) => fmtTokens(row.tokens.totalTokens) },
+        { key: 'duration', label: usageCopy.duration, align: 'right', render: (row: any) => fmtMs(row.durationMs) },
+        { key: 'cost', label: usageCopy.cost, align: 'right', render: (row: any) => fmtCost(row.cost.total) },
+        {
+          key: 'status',
+          label: usageCopy.status,
+          render: (row: any) =>
+            h('span', { style: { color: stopReasonColor(row.stopReason) } }, stopReasonLabel(row.stopReason))
+        }
+      ]
+
+      return h(
+        'div',
+        { style: usageStyles.wrap },
+        h('div', { style: usageStyles.panelTitle }, usageCopy.title),
+        toolRow,
+        notice ? h('div', { style: usageStyles.meta }, notice) : null,
+        status && status.enabled === false ? h('div', { style: usageStyles.empty }, usageCopy.disabled) : null,
+        h(
+          'div',
+          { style: usageStyles.grid },
+          h(MetricCard, { key: 'r', label: usageCopy.requests, value: fmtInt(overview.requests), hint: `${usageCopy.errors} ${fmtPct(overview.errorRate)}` }),
+          h(MetricCard, { key: 't', label: usageCopy.totalTokens, value: fmtTokens(tokens.totalTokens) }),
+          h(MetricCard, { key: 'c', label: usageCopy.cacheRate, value: fmtPct(overview.cacheRate), hint: `节省 ${fmtPct(overview.cacheSavings)}` }),
+          h(MetricCard, { key: 'cost', label: usageCopy.cost, value: fmtCost(cost.total), hint: usageCopy.costHint })
+        ),
+        h(
+          'div',
+          { style: usageStyles.grid },
+          h(MetricCard, { key: 'i', label: usageCopy.input, value: fmtTokens(tokens.inputTokens) }),
+          h(MetricCard, { key: 'o', label: usageCopy.output, value: fmtTokens(tokens.outputTokens) }),
+          h(MetricCard, { key: 'cr', label: usageCopy.cacheRead, value: fmtTokens(tokens.cacheReadTokens) }),
+          h(MetricCard, { key: 'ttft', label: usageCopy.avgTtft, value: fmtMs(overview.avgTtftMs) }),
+          h(MetricCard, { key: 'd', label: usageCopy.avgDuration, value: fmtMs(overview.avgDurationMs) }),
+          h(MetricCard, {
+            key: 'tps',
+            label: usageCopy.throughput,
+            value: overview.tokensPerSecond === null ? '—' : `${overview.tokensPerSecond.toFixed(1)} tok/s`
+          })
+        ),
+        h(
+          'div',
+          { style: usageStyles.panel },
+          h('div', { style: usageStyles.panelTitle }, usageCopy.trend),
+          h(UsageTrend, { points: data.series })
+        ),
+        h(
+          'div',
+          { style: usageStyles.panel },
+          h('div', { style: usageStyles.panelTitle }, usageCopy.byModel),
+          h(UsageTable, { columns: modelColumns, rows: data.models })
+        ),
+        h(
+          'div',
+          { style: usageStyles.panel },
+          h('div', { style: usageStyles.panelTitle }, usageCopy.byProject),
+          h(UsageTable, { columns: projectColumns, rows: data.projects })
+        ),
+        h(
+          'div',
+          { style: usageStyles.panel },
+          h('div', { style: usageStyles.panelTitle }, usageCopy.recent),
+          h(UsageTable, {
+            columns: recentColumns,
+            rows: (data.recent || []).slice(0, 12),
+            empty: usageCopy.noData
+          }),
+          h('div', { style: usageStyles.meta }, usageCopy.note)
+        )
+      )
+    }
+
     const inject = ['slots']
 
     function apply(ctx: any) {
@@ -333,11 +911,55 @@
           AntigravityCard
         )
       )
+      /**
+       * The usage page is offered only to a user who has an Antigravity
+       * account. `settings.section` has no per-entry visibility switch, so the
+       * gate *is* the registration: probe the host once, register only on a
+       * true answer, and keep the probe cancelable so an unmounting fiber can
+       * never leave a late registration behind.
+       */
+      ctx.slots.inject('settings.section', () => {
+        let dispose = null
+        let cancelled = false
+        probeAccount().then(authenticated => {
+          if (cancelled || !authenticated) return
+          dispose = ctx.slots.register(
+            {
+              name: 'settings.section',
+              id: 'antigravity-usage',
+              order: 30,
+              label: () => usageCopy.title
+            },
+            AntigravityUsagePanel
+          )
+        })
+        return () => {
+          cancelled = true
+          if (typeof dispose === 'function') dispose()
+        }
+      })
+    }
+
+    /**
+     * Ask the host whether an Antigravity account is installed.
+     *
+     * Any failure means "no": a headless surface, an older build without the
+     * usage routes, or a signed-out user all end up with no panel instead of a
+     * broken one.
+     */
+    async function probeAccount(): Promise<boolean> {
+      try {
+        const status = await getJson(`${USAGE_ROUTE}/status`)
+        return status != null && status.authenticated === true
+      } catch {
+        return false
+      }
     }
 
     exports.apply = apply
     exports.inject = inject
     exports.AntigravityCard = AntigravityCard
+    exports.AntigravityUsagePanel = AntigravityUsagePanel
     return module.exports
   }
 })

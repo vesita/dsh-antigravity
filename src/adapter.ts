@@ -48,6 +48,32 @@ export interface ResolvedImage {
 /** Resolve one durable attachment reference into inline image bytes. */
 export type ImageResolver = (ref: unknown) => Promise<ResolvedImage | null>
 
+/**
+ * One settled provider call, as the usage collector consumes it.
+ *
+ * The adapter observes its own stream and hands this over exactly once per
+ * call, whether the call succeeded, failed, or was aborted — a settled call is
+ * what the accounting needs, and the reason travels alongside it.
+ */
+export interface CallObservation {
+  /** Call completion time, epoch ms. */
+  time: number
+  /** DSH-facing model id the caller asked for. */
+  model: string
+  /** Session the call belongs to, empty when the caller is not session-bound. */
+  sessionId: string
+  /** Request start → first content chunk, ms; null when no content ever arrived. */
+  ttftMs: number | null
+  /** Request start → stream end, ms. */
+  durationMs: number
+  /** `stop` / `tool-calls` / `max-tokens` / `error` / `aborted`. */
+  stopReason: string
+  /** Provider failure text; empty on success. */
+  errorMessage: string
+  /** Provider-reported usage, or null when the call never reported any. */
+  tokens: TokenUsage | null
+}
+
 /** Every fact the adapter reads, supplied by the mounting plugin. */
 export interface AdapterOptions {
   /** Active catalog, read fresh on every call so settings edits apply live. */
@@ -64,6 +90,13 @@ export interface AdapterOptions {
   resolveRetryPolicy?: () => ResolvedRetryPolicy | undefined
   /** Resolve one attachment reference into inline image bytes. */
   resolveImage?: ImageResolver
+  /**
+   * Called once per settled call with what the stream reported.
+   *
+   * Observation is deliberately fire-and-forget and fully guarded: an
+   * accounting failure must never turn a working model call into a broken one.
+   */
+  observe?: (observation: CallObservation) => void
 }
 
 /**
@@ -184,24 +217,71 @@ export class GoogleAntigravityAdapter extends LlmAdapter {
   }
 
   async *stream(options: GenerateOptions): AsyncGenerator<StreamChunk, void, unknown> {
-    const catalog = this.#catalog()
-    const spec = resolveModelSpec(options.model, catalog)
-    const wireModel = spec?.wireId || options.model
+    const startedAt = Date.now()
+    const observe = this.options.observe
+    let ttftMs: number | null = null
+    let usage: TokenUsage | null = null
+    let finish: FinishReason | undefined
+    let failure = ''
+    let settled = false
 
-    const creds = await this.#credentials(options.signal)
-    const endpoints = this.#endpoints()
-    const request = await buildRequest(options, spec, this.options.resolveImage)
-    const payload = {
-      project: creds.projectId || this.options.resolveProjectId?.() || 'aicode-consumers',
-      model: wireModel,
-      requestId: `agent/${randomUUID()}/${Date.now()}/${randomUUID()}/1`,
-      request,
-      userAgent: 'antigravity',
-      requestType: 'agent'
+    try {
+      const catalog = this.#catalog()
+      const spec = resolveModelSpec(options.model, catalog)
+      const wireModel = spec?.wireId || options.model
+
+      const creds = await this.#credentials(options.signal)
+      const endpoints = this.#endpoints()
+      const request = await buildRequest(options, spec, this.options.resolveImage)
+      const payload = {
+        project: creds.projectId || this.options.resolveProjectId?.() || 'aicode-consumers',
+        model: wireModel,
+        requestId: `agent/${randomUUID()}/${Date.now()}/${randomUUID()}/1`,
+        request,
+        userAgent: 'antigravity',
+        requestType: 'agent'
+      }
+
+      const response = await this.#openStream(endpoints, creds.access, payload, options.signal)
+      for await (const chunk of parseStream(response, spec)) {
+        // Time to first token measures the first piece of model output. Usage
+        // and finish chunks are bookkeeping, and a block-start carries no
+        // content of its own, so none of them may start the clock.
+        if (
+          ttftMs === null
+          && (chunk.type === 'text-delta' || chunk.type === 'reasoning-delta' || chunk.type === 'tool-call-delta')
+        ) {
+          ttftMs = Date.now() - startedAt
+        }
+        if (chunk.type === 'usage') usage = chunk.usage
+        else if (chunk.type === 'finish') finish = chunk.reason
+        yield chunk
+      }
+      settled = true
+    } catch (error) {
+      failure = error instanceof Error ? error.message : String(error)
+      throw error
+    } finally {
+      // The generator settles exactly once: on normal completion, on a thrown
+      // provider failure, or when the consumer stops early (an abort). All
+      // three are worth accounting for, so the report lives in `finally`.
+      if (observe !== undefined) {
+        try {
+          observe({
+            time: Date.now(),
+            model: options.model,
+            sessionId: options.sessionId === undefined ? '' : String(options.sessionId),
+            ttftMs,
+            durationMs: Date.now() - startedAt,
+            stopReason: failure !== '' ? 'error' : settled ? String(finish?.kind ?? 'stop') : 'aborted',
+            errorMessage: failure,
+            tokens: usage
+          })
+        } catch {
+          /* accounting must never break a model call */
+        }
+      }
     }
-
-    const response = await this.#openStream(endpoints, creds.access, payload, options.signal)
-    yield* parseStream(response, spec)
   }
 
   async #credentials(signal?: AbortSignal): Promise<AntigravityCredentials> {

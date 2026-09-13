@@ -254,6 +254,13 @@ const vm = await import('node:vm')
 
 const clientSource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'lib', 'client.js'), 'utf8')
 let registration = null
+/**
+ * The bundle's factory closes over the sandbox realm, so its `fetch` resolves
+ * to THIS object rather than the test process's global — a page-level global
+ * that only exists in a browser. Stubbing it here is what lets the account
+ * probe be exercised at all; `accountAnswer` is what each test varies.
+ */
+let accountAnswer = { authenticated: true }
 const sandbox = {
   window: {
     __ModuleLoader__: {
@@ -263,6 +270,11 @@ const sandbox = {
     }
   },
   navigator: { language: 'zh-CN' },
+  fetch: async () => ({
+    ok: true,
+    status: 200,
+    json: async () => accountAnswer
+  }),
   require: specifier => {
     throw new Error(`unexpected top-level require: ${specifier}`)
   }
@@ -332,25 +344,66 @@ await check('bundle exports apply/inject', () => {
   assert.strictEqual(typeof clientExports.apply, 'function')
   assert.deepStrictEqual([...clientExports.inject], ['slots'])
 })
-await check('apply registers the provider-card cell for llm-antigravity', () => {
-  let injectedKey = null
-  let registered = null
+await check('apply registers the provider-card cell', () => {
+  const injections = []
+  const registrations = []
   const fakeCtx = {
     slots: {
       inject(key, callback) {
-        injectedKey = key
+        injections.push(key)
         callback()
       },
       register(options, component) {
-        registered = { options, component }
+        registrations.push({ options, component })
         return () => {}
       }
     }
   }
   clientExports.apply(fakeCtx)
-  assert.strictEqual(injectedKey, 'settings.models.provider-card')
-  assert.strictEqual(registered.options.key, 'llm-antigravity')
-  assert.strictEqual(typeof registered.component, 'function')
+  assert.deepStrictEqual(injections, ['settings.models.provider-card', 'settings.section'])
+  const card = registrations.find(entry => entry.options.name === 'settings.models.provider-card')
+  assert.strictEqual(card.options.key, 'llm-antigravity')
+  assert.strictEqual(typeof card.component, 'function')
+})
+
+/** Run `apply` against a stubbed host answer for the account probe. */
+async function applyWithAccount(authenticated) {
+  const registrations = []
+  const fakeCtx = {
+    slots: {
+      inject(key, callback) {
+        callback()
+      },
+      register(options, component) {
+        registrations.push({ options, component })
+        return () => {}
+      }
+    }
+  }
+  accountAnswer = { authenticated }
+  clientExports.apply(fakeCtx)
+  // The registration is a promise away: the probe is what decides.
+  await new Promise(resolve => setTimeout(resolve, 20))
+  return registrations
+}
+
+await check('没有账户时不注册用量页', async () => {
+  const registrations = await applyWithAccount(false)
+  assert.strictEqual(
+    registrations.find(entry => entry.options.name === 'settings.section'),
+    undefined,
+    'an account-less install must not show the usage page'
+  )
+})
+
+await check('有账户时注册用量页', async () => {
+  const registrations = await applyWithAccount(true)
+  const usage = registrations.find(entry => entry.options.name === 'settings.section')
+  assert.ok(usage, 'an installed account must show the usage page')
+  assert.strictEqual(usage.options.id, 'antigravity-usage')
+  assert.strictEqual(usage.options.order, 30)
+  assert.strictEqual(typeof usage.options.label, 'function')
+  assert.strictEqual(typeof usage.component, 'function')
 })
 await check('card renders a visible sign-in button while signed out', () => {
   const face = registration.factory(requireFace(fakeReact()))
@@ -585,7 +638,16 @@ const CANCEL = '/dsh-antigravity/auth/cancel'
 const LOGOUT = '/dsh-antigravity/auth/logout'
 
 await check('the host registers exactly the four routes the card calls', () => {
-  assert.deepStrictEqual([...registeredPaths].sort(), [CANCEL, LOGIN, LOGOUT, STATUS])
+  const authPaths = [...registeredPaths].filter(entry => entry.startsWith('/dsh-antigravity/auth')).sort()
+  assert.deepStrictEqual(authPaths, [CANCEL, LOGIN, LOGOUT, STATUS])
+  const usagePaths = [...registeredPaths].filter(entry => entry.startsWith('/dsh-antigravity/usage')).sort()
+  assert.deepStrictEqual(usagePaths, [
+    '/dsh-antigravity/usage/backfill',
+    '/dsh-antigravity/usage/clear',
+    '/dsh-antigravity/usage/overview',
+    '/dsh-antigravity/usage/requests',
+    '/dsh-antigravity/usage/status'
+  ])
 })
 await check('no account: /status reports the signed-out posture', async () => {
   const { status, body } = await request('GET', STATUS)

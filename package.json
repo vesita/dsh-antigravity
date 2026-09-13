@@ -1,6 +1,6 @@
 {
   "name": "dsh-antigravity",
-  "version": "0.2.5",
+  "version": "0.3.0",
   "description": "适用于 DeepSeek Harness 的 Google Antigravity 模型提供商适配器插件（原生 LlmAdapter + 内置登录 UI）",
   "type": "module",
   "main": "lib/index.js",
@@ -33,7 +33,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json && tsc -p tsconfig.client.json && chmod +x lib/bin.js",
     "prepack": "npm run build",
-    "test": "npm run build && node test/test.js",
+    "test": "npm run build && node test/test.js && node test/usage.js",
     "test:types": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.client.json --noEmit"
   },
   "dependencies": {
