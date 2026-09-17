@@ -301,6 +301,33 @@ check('buildSnapshot 汇总窗口内的记录', () => {
   assert.strictEqual(snapshot.recent.length, 1)
 })
 
+check('快照按会话分组：key 是完整 session id，label 是短标签', () => {
+  // The data layer already stores session_id (indexed), so this is pure aggregation —
+  // no schema change, no migration. Checked against hand-built records so the labels
+  // are pinned rather than inferred.
+  const probe = new UsageStore(':memory:')
+  probe.insert('k-long-1', record({ sessionId: 'session-2f2e2587-ad46-4a7e-ac59-058041f3156e', time: 1_000_000 }))
+  probe.insert('k-long-2', record({ sessionId: 'session-2f2e2587-ad46-4a7e-ac59-058041f3156e', time: 1_000_001 }))
+  probe.insert('k-bare', record({ sessionId: '9eed14a9-149a-4e31-a714-6b5654df2ab1', time: 1_000_002 }))
+  probe.insert('k-none', record({ sessionId: '', time: 1_000_003 }))
+  const snapshot = buildSnapshot(probe, DEFAULT_PRICING, 'all', { now: 1_000_004 })
+  const keys = snapshot.sessions.map(row => row.key).sort()
+  assert.deepStrictEqual(keys, [
+    '(unknown)',
+    '9eed14a9-149a-4e31-a714-6b5654df2ab1',
+    'session-2f2e2587-ad46-4a7e-ac59-058041f3156e'
+  ], '每个会话一组，空 id 归入 (unknown)：' + JSON.stringify(keys))
+  const top = snapshot.sessions.find(row => row.key.startsWith('session-'))
+  assert.strictEqual(top.label, '2f2e2587', '长 id 缩短成前 8 位：' + top.label)
+  assert.strictEqual(top.overview.requests, 2, '同一会话的两条记录合并成一组')
+  const bare = snapshot.sessions.find(row => row.key.startsWith('9eed'))
+  assert.strictEqual(bare.label, '9eed14a9', '没有 session- 前缀的 id 也照缩短')
+  // 分组必须加起来等于总数 —— 否则表会看着"少了调用"。
+  const sum = snapshot.sessions.reduce((n, row) => n + row.overview.requests, 0)
+  assert.strictEqual(sum, snapshot.overview.requests, '各会话请求数之和 === 窗口总数')
+  probe.close()
+})
+
 check('buildRequests 附带成本与项目标签，且限制行数', () => {
   const rows = buildRequests(store, DEFAULT_PRICING, { range: 'all', limit: 10 })
   assert.strictEqual(rows.length, 1)
@@ -451,6 +478,7 @@ async function observeCall(options = {}) {
       observe: observation => observations.push(observation)
     })
     const chunks = []
+    let failure = null
     try {
       for await (const chunk of adapter.stream({
         provider: 'google-antigravity',
@@ -461,9 +489,9 @@ async function observeCall(options = {}) {
         chunks.push(chunk)
       }
     } catch (error) {
-      /* the failure path is asserted through the observation */
+      failure = error
     }
-    return { observations, chunks }
+    return { observations, chunks, failure }
   } finally {
     globalThis.fetch = originalFetch
   }
@@ -645,6 +673,49 @@ const failureOutcome = await backfillFromSessions({
 check('回填遇缺失的解压器只报告失败，不中断整体', () => {
   assert.strictEqual(failureOutcome.failed.length, 1)
   assert.match(failureOutcome.failed[0], /sess-z/)
+})
+
+// ---------------------------------------------------------------------------
+// 429 的呈现：现场实测（16195 条用量记录）里 429 **全是配额耗尽**，不是瞬时限流，
+// 所以这里既要求把"多久后重置"讲清楚，也用负向对照守住"别给普通 429 乱扣配额帽子"。
+// 同时钉住"只打一次端点"——429 会让端点轮询立刻 break（配额与鉴权都不是端点级的）。
+// ---------------------------------------------------------------------------
+const QUOTA_BODY = JSON.stringify({
+  error: {
+    code: 429,
+    message: 'Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 1h31m29s.',
+    status: 'RESOURCE_EXHAUSTED',
+    details: [{ reason: 'QUOTA_EXHAUSTED' }]
+  }
+})
+
+let quotaCalls = 0
+const quota = await observeCall({
+  fetch: async () => {
+    quotaCalls += 1
+    return new Response(QUOTA_BODY, { status: 429 })
+  }
+})
+
+check('429 配额耗尽：错误消息说清"配额已用尽 + 何时重置"', () => {
+  const message = String(quota.failure && quota.failure.message)
+  assert.ok(message.includes('配额已用尽'), message)
+  assert.ok(message.includes('1h31m29s'), '带上重置时间：' + message)
+  assert.ok(message.includes('不会自动重试'), message)
+  assert.strictEqual(quota.failure.code, 'QUOTA_EXCEEDED')
+  assert.ok(/Antigravity 端点/.test(message), '仍指明是哪个端点：' + message)
+})
+
+check('429 时端点轮询立刻收手（鉴权/配额不是端点级故障）', () => {
+  assert.strictEqual(quotaCalls, 1, '只打了一次：' + quotaCalls)
+})
+
+check('负向对照：非配额语义的 429 保持原始响应，不被扣上"配额"帽子', async () => {
+  const odd = await observeCall({ fetch: async () => new Response('{"error":{"message":"weird throttling"}}', { status: 429 }) })
+  const message = String(odd.failure && odd.failure.message)
+  assert.ok(!message.includes('配额已用尽'), message)
+  assert.ok(message.includes('weird throttling'), message)
+  assert.strictEqual(odd.failure.code, 'QUOTA_EXCEEDED')
 })
 
 console.log(`\n用量模型测试全部通过：${passed} 项`)

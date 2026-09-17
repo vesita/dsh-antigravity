@@ -15,7 +15,7 @@ import {
 } from '../lib/auth.js'
 import { MODEL_CATALOG, resolveModelSpec } from '../lib/models.js'
 import { toAntigravityToolSchema } from '../lib/tool-schema.js'
-import antigravityPlugin from '../lib/index.js'
+import antigravityPlugin, { version as antigravityVersion } from '../lib/index.js'
 
 /**
  * Every test that touches credentials must stay inside a throwaway `DSH_HOME`:
@@ -1071,6 +1071,28 @@ const cappedStream = await parseSse([
 ])
 await check('负控：零内容 + MAX_TOKENS -> max-tokens（独立结局，不算空回答）', () => {
   assert.strictEqual(finishOf(cappedStream).reason.kind, 'max-tokens')
+})
+
+// ---------------------------------------------------------------------------
+// 版本可见性：装的是哪一版，必须能问出来。
+//
+// 为什么值得一条测试：这个插件从 tarball 安装，而 pnpm 把 `file:` 依赖按路径判为已满足 ——
+// 同版本号覆盖 tarball **不会**刷新 node_modules（实测：install 报 "Lockfile is up to date"、
+// install --force 从 store 复用旧内容、只删 node_modules/<pkg> 也没用）。
+// 于是"源码 0.3.3、装的是 0.2.5"是默认结果而不是意外，唯一的解法是让运行时的版本可读。
+// ---------------------------------------------------------------------------
+const packageVersion = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version
+
+await check('导出的 version 与 package.json 一致（且非 unknown）', () => {
+  assert.notStrictEqual(antigravityVersion, 'unknown', '版本读不出来说明路径假设错了')
+  assert.strictEqual(antigravityVersion, packageVersion, `导出 ${antigravityVersion} vs package.json ${packageVersion}`)
+})
+
+await check('默认导出带上 name / inject / apply / Config', () => {
+  assert.strictEqual(antigravityPlugin.name, 'dsh-antigravity')
+  assert.deepStrictEqual([...antigravityPlugin.inject], ['llm'])
+  assert.strictEqual(typeof antigravityPlugin.apply, 'function')
+  assert.ok(antigravityPlugin.Config)
 })
 
 console.log(`\n所有 dsh-antigravity 单元测试通过（${passed} 项）`)

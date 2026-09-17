@@ -2,6 +2,7 @@ import z from '@deepseek-ai/schemastery'
 import { RetryPolicySchema } from '@deepseek-ai/dsh-llm'
 import type { ReasoningEffortId, ResolvedRetryPolicy } from '@deepseek-ai/dsh-llm'
 import type { IncomingMessage, Server, ServerResponse } from 'node:http'
+import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import { GoogleAntigravityAdapter } from './adapter.js'
 import type { ResolvedImage } from './adapter.js'
@@ -46,6 +47,32 @@ import { dshHome } from './auth.js'
 
 export const name = 'dsh-antigravity'
 export const inject = ['llm']
+
+/**
+ * The version of the code that is **actually loaded**, read from the installed
+ * `package.json` at import time rather than typed in here.
+ *
+ * Why it matters: this plugin is installed from a tarball, and `pnpm` treats a
+ * `file:` dependency as satisfied when the path matches — replacing the tarball
+ * at the same version does **not** refresh `node_modules` (measured: `install`
+ * says "Lockfile is up to date", `install --force` reuses the cached copy, and
+ * deleting `node_modules/<pkg>` alone is not enough either). So the source tree
+ * can say one version while the running copy is another, and there was no way
+ * to tell which one you were talking to.
+ *
+ * Reading it from the package file means the two can never disagree: whatever
+ * this returns **is** what is loaded. It is logged at load and exposed on
+ * `/status` for exactly that question.
+ */
+export const version: string = (() => {
+  try {
+    const parsed = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version?: unknown }
+    return typeof parsed.version === 'string' && parsed.version !== '' ? parsed.version : 'unknown'
+  } catch {
+    // A missing/renamed package file must not take the provider down.
+    return 'unknown'
+  }
+})()
 
 /** Settings namespace this plugin owns. */
 const NS = 'llm-antigravity'
@@ -118,6 +145,11 @@ interface SettingsSeam {
 /** Shape of the `/status` payload the browser half consumes. */
 interface StatusPayload {
   authenticated: boolean
+  /**
+   * Version of the loaded code (see {@link version}). Present so "which build am
+   * I actually running" is answerable without guessing from the source tree.
+   */
+  version?: string
   email?: string | null
   projectId?: string | null
   expires?: number | null
@@ -184,6 +216,11 @@ export function apply(ctx: any, config: AntigravitySettings = {}): void {
   let proxyKey: string | null = null
   /** Last observed value of the `account` marker, for set → unset detection. */
   let previousAccount: string | undefined
+
+  // Say which build this is, once, at load. This is the only place the running
+  // version becomes visible in a deployment: `dsh-antigravity: v0.3.4 已加载`.
+  // Without it, "源码改了但装的是旧 tarball" is invisible from inside.
+  ctx.logger?.info?.(`dsh-antigravity: v${version} 已加载（provider ${PROVIDER}）`)
 
   // -------------------------------------------------------------------------
   // Usage accounting
@@ -487,6 +524,7 @@ export function apply(ctx: any, config: AntigravitySettings = {}): void {
         await markAccountInstalled(creds)
         return {
           authenticated: true,
+          version,
           email: creds.email ?? null,
           projectId: creds.projectId ?? 'aicode-consumers',
           expires: typeof creds.expires === 'number' ? creds.expires : null,
@@ -504,6 +542,7 @@ export function apply(ctx: any, config: AntigravitySettings = {}): void {
         }
         return {
           authenticated: false,
+          version,
           expired: Boolean(stored?.access),
           email: stored?.email ?? null,
           projectId: stored?.projectId ?? null,

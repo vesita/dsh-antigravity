@@ -340,7 +340,10 @@ export class GoogleAntigravityAdapter extends LlmAdapter {
         })
         if (res.ok && res.body) return res
         const body = await res.text().catch(() => '')
-        lastError = new LlmError(`Antigravity 端点 ${base} 返回 ${res.status}: ${body.slice(0, 500)}`, httpCode(res.status))
+        lastError = new LlmError(
+          res.status === 429 ? quotaMessage(base, res.status, body) : `Antigravity 端点 ${base} 返回 ${res.status}: ${body.slice(0, 500)}`,
+          httpCode(res.status)
+        )
         // Authentication and quota failures are not endpoint-specific.
         if (res.status === 401 || res.status === 403 || res.status === 429) break
       } catch (error) {
@@ -359,6 +362,36 @@ function httpCode(status: number): string {
   if (status === 429) return 'QUOTA_EXCEEDED'
   if (status >= 500) return 'TRANSPORT'
   return 'INVALID_REQUEST'
+}
+
+/**
+ * Turn a 429 response body into something a human can act on.
+ *
+ * Measured against this deployment's own usage database (16195 rows): every 429
+ * the provider returned was quota exhaustion, not transient throttling —
+ * `"Resource has been exhausted (e.g. check quota)"`, or
+ * `"Individual quota reached. Please upgrade your subscription… Resets in 1h31m29s."`
+ * So the body already carries the two facts that matter (it is quota, and when it
+ * resets); the raw JSON blob was just burying them.
+ *
+ * Deliberately **not** changing the code to `RATE_LIMIT`: that would put these
+ * failures into `dsh-llm-retry`'s retryable set and spend the retry budget on a
+ * wait measured in minutes-to-hours. Surfacing the wait is the useful fix; the
+ * raw body is kept (truncated) so nothing is hidden.
+ *
+ * @param base - endpoint that answered.
+ * @param status - HTTP status (always 429 here).
+ * @param body - raw response text.
+ * @returns one actionable sentence.
+ */
+function quotaMessage(base: string, status: number, body: string): string {
+  const raw = String(body || '')
+  const head = `Antigravity 端点 ${base} 返回 ${status}`
+  const isQuota = /QUOTA_EXHAUSTED|Individual quota reached|Resource has been exhausted/i.test(raw)
+  if (!isQuota) return `${head}: ${raw.slice(0, 500)}`
+  const reset = /Resets in ([0-9]+h)?([0-9]+m)?([0-9]+(?:\.[0-9]+)?s)/i.exec(raw)
+  const when = reset === null ? '' : `，约 ${reset[0].replace(/^Resets in /i, '')} 后重置`
+  return `${head}：配额已用尽${when}。这不是退避重试能解决的（不会自动重试）；请等重置、或升级订阅。原始响应：${raw.slice(0, 300)}`
 }
 
 // ---------------------------------------------------------------------------

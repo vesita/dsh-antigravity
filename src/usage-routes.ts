@@ -10,6 +10,7 @@ import {
   projectLabel,
   rangeSpec,
   seriesOf,
+  sessionLabel,
   summarize
 } from './usage-model.js'
 import type {
@@ -66,6 +67,14 @@ export interface UsageSnapshot {
   series: UsageSeriesPoint[]
   models: UsageGroupView[]
   projects: UsageGroupView[]
+  /**
+   * Per-session totals.
+   *
+   * The data layer already stores `session_id` (with an index on it), so "which session burned
+   * this" needs no schema change and no migration — only this aggregation. `key` is the full
+   * session id (use it to line a row up with a transcript); `label` is the short form.
+   */
+  sessions: UsageGroupView[]
   agents: UsageGroupView[]
   /** Newest calls in the window, so the first screen costs one request. */
   recent: UsageRequestView[]
@@ -159,6 +168,14 @@ export function buildSnapshot(
     overview: group.overview
   }))
 
+  // Sessions group by the stored session id. `(unknown)` collects rows written before the id was
+  // available (backfill gaps) so the group totals still add up to the window total.
+  const sessions: UsageGroupView[] = groupBy(records, record => record.sessionId || '(unknown)', pricing).map(group => ({
+    key: group.key,
+    label: sessionLabel(group.key),
+    overview: group.overview
+  }))
+
   const overview = summarize(records, pricing)
   // Widest range already IS the lifetime total, so the extra pass is skipped
   // exactly when it would be redundant.
@@ -173,6 +190,7 @@ export function buildSnapshot(
     series: seriesOf(records, spec, now, pricing),
     models,
     projects,
+    sessions,
     agents,
     recent: records.slice(0, 20).map(record => ({
       ...record,

@@ -350,6 +350,7 @@
           trend: '请求趋势',
           byModel: '按模型',
           byProject: '按项目',
+          bySession: '按会话',
           recent: '最近请求',
           refresh: '刷新',
           refreshing: '刷新中…',
@@ -357,6 +358,7 @@
           noData: '暂无数据',
           model: '模型',
           project: '项目',
+          session: '会话',
           calls: '请求',
           tokens: '词元',
           ttft: 'TTFT',
@@ -397,6 +399,7 @@
           trend: 'Request trend',
           byModel: 'By model',
           byProject: 'By project',
+          bySession: 'By session',
           recent: 'Recent requests',
           refresh: 'Refresh',
           refreshing: 'Refreshing…',
@@ -404,6 +407,7 @@
           noData: 'No data',
           model: 'Model',
           project: 'Project',
+          session: 'Session',
           calls: 'Calls',
           tokens: 'Tokens',
           ttft: 'TTFT',
@@ -834,6 +838,16 @@
         { key: 'cost', label: usageCopy.cost, align: 'right', render: (row: any) => fmtCost(row.overview.cost.total) }
       ]
 
+      // 会话维度跟项目维度同形，只换第一列的标签来源（sessionLabel 已把长 id 缩短）。
+      const sessionColumns = [
+        { key: 'session', label: usageCopy.session, render: (row: any) => row.label },
+        { key: 'calls', label: usageCopy.calls, align: 'right', render: (row: any) => fmtInt(row.overview.requests) },
+        { key: 'tokens', label: usageCopy.tokens, align: 'right', render: (row: any) => fmtTokens(row.overview.tokens.totalTokens) },
+        { key: 'rate', label: usageCopy.cacheRate, align: 'right', render: (row: any) => fmtPct(row.overview.cacheRate) },
+        { key: 'errors', label: usageCopy.errors, align: 'right', render: (row: any) => fmtPct(row.overview.errorRate) },
+        { key: 'cost', label: usageCopy.cost, align: 'right', render: (row: any) => fmtCost(row.overview.cost.total) }
+      ]
+
       const recentColumns = [
         { key: 'time', label: usageCopy.time, render: (row: any) => fmtClock(row.time) },
         { key: 'model', label: usageCopy.model, render: (row: any) => row.model },
@@ -920,6 +934,12 @@
           { style: usageStyles.panel },
           h('div', { style: usageStyles.panelTitle }, usageCopy.byProject),
           h(UsageTable, { columns: projectColumns, rows: data.projects })
+        ),
+        h(
+          'div',
+          { style: usageStyles.panel },
+          h('div', { style: usageStyles.panelTitle }, usageCopy.bySession),
+          h(UsageTable, { columns: sessionColumns, rows: data.sessions || [], empty: usageCopy.noData })
         ),
         h(
           'div',

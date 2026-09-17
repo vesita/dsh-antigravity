@@ -510,3 +510,21 @@ export function projectLabel(cwd: string): string {
   if (parts.length === 0) return trimmed
   return parts.slice(-2).join('/')
 }
+
+/**
+ * Collapse a session id into a short label for the usage table.
+ *
+ * Session ids are long (`session-2f2e2587-ad46-4a7e-…`) and the column is narrow, so the label
+ * shows just the leading id chunk. The **full** id stays in the group's `key` — that is what
+ * correlates a row with a transcript; the label is for reading, not for matching.
+ *
+ * @param sessionId - the stored `session_id`, possibly empty.
+ * @returns the short label (`(unknown)` when there is no session to name).
+ */
+export function sessionLabel(sessionId: string): string {
+  const raw = String(sessionId || '').trim()
+  if (raw === '') return '(unknown)'
+  const stripped = raw.startsWith('session-') ? raw.slice('session-'.length) : raw
+  const head = stripped.split('-')[0] || stripped
+  return head.slice(0, 8)
+}

@@ -2,20 +2,20 @@
 
 DeepSeek Harness (DSH) 的 **Google Antigravity** 模型提供商插件：原生 `LlmAdapter` 实现 + 内置登录 UI + 自有凭据存储。
 
-> **不再依赖 omp。** 旧版会读写 `~/.omp/agent/agent.db` 复用 Oh My Pi 的登录态；本版完全移除了该耦合，凭据只落在 DSH 自己的 `ctx.credentials` 记录与 `~/.dsh/antigravity-auth.json`（0600）中。
+凭据只落在 DSH 自己的 `ctx.credentials` 记录与 `~/.dsh/antigravity-auth.json`（0600）中，不读写任何第三方应用的数据库（见「凭据存放位置」）。
 
 ---
 
-## 它解决了什么
+## 它能做什么
 
-| 旧版问题 | 本版做法 |
+| 能力 | 实现 |
 | --- | --- |
-| 在 `llm-pi-ai` 命名空间下声明 `providers.google-antigravity`，但 pi-ai 没有该路由的内置目录且配置里没有 `models`，触发 `llm-pi-ai: provider "google-antigravity" resolves no models` | 提供商目录改挂插件自有的 `llm-antigravity` 命名空间；`google-antigravity` 只由原生适配器提供，pi-ai 完全不参与 |
-| 只有 CLI 能登录，设置页没有登录入口 | 通过 `settings.models.provider-card` 插槽在「设置 → 模型 → Google Antigravity」卡片内提供登录 / 退出 / 状态 UI |
-| 读写 `~/.omp/agent/agent.db`，退出登录会删除 omp 的记录 | 凭据写入 `ctx.credentials`（`dsh-antigravity/google-antigravity` 记录）并镜像到 `~/.dsh/antigravity-auth.json` |
-| 每次 DSH 启动都强占 8045 端口跑代理 | OpenAI 兼容代理改为**可选**（`proxy.enabled`，默认关闭） |
-| 适配器把带 `thoughtSignature` 的普通文本误判为思考过程；`block-end` 文本错位；工具调用被 `MAX_TOKENS` 覆盖 | 只以 `part.thought === true` 判定思考；块状态机重写；工具调用优先于 `max-tokens` |
-| 工具 schema 里的 `const` 被原样透传给 Gemini 端点，**整包** 400（`Unknown name "const"`）—— DSH 自带的 `cordis_define` 就用它，于是任何带该工具的 agent 一旦路由到 Antigravity 就在首次请求上失败 | 构造请求前投影工具 schema：`const` → 单值 `enum`，剥掉端点不认的引用/文档关键字；原生适配器与 OpenAI 兼容代理共用同一投影 |
+| 原生提供商路由 | 提供商目录挂在插件自有的 `llm-antigravity` 命名空间；`google-antigravity` 只由原生适配器提供 |
+| 设置页登录入口 | 通过 `settings.models.provider-card` 插槽在「设置 → 模型 → Google Antigravity」卡片内提供登录 / 退出 / 状态 UI |
+| 自有凭据存储 | 凭据写入 `ctx.credentials`（`dsh-antigravity/google-antigravity` 记录）并镜像到 `~/.dsh/antigravity-auth.json` |
+| 可选 OpenAI 兼容代理 | `proxy.enabled` 开启（默认关闭）时，为不能加载 DSH 插件的客户端提供 OpenAI 兼容端点 |
+| 思考与工具调用解析 | 只以 `part.thought === true` 判定思考过程；块状态机解析流式响应；工具调用优先于 `max-tokens` |
+| 工具 schema 方言投影 | 构造请求前投影工具 schema：`const` → 单值 `enum`，剥掉端点不认的引用/文档关键字；原生适配器与 OpenAI 兼容代理共用同一投影 |
 
 ---
 
@@ -120,13 +120,11 @@ dsh-antigravity proxy --port 8045
 | 按项目 | 按会话工作目录聚合，展示末两级路径作为短标签 |
 | 最近请求 | 最近 12 条：时间、模型、词元、时长、等价成本、成功/失败/中止 |
 
-「累计条」是刻意独立于范围选择器的：**「一共用了多少」和「这个窗口用了多少」是两个问题**，
-不该逼着人把范围切到最宽再从卡片里读回来。参考实现没有这个概念——它的总用量就是把整个
-dashboard 切到 `All`。
+「累计条」独立于范围选择器：**「一共用了多少」和「这个窗口用了多少」是两个问题**，
+不该逼着人把范围切到最宽再从卡片里读回来。
 
 同理，**「窗口内为空」不等于「从未记录」**：默认 24h 窗口里没有调用、但历史里有几千条时，
 面板会显示累计数量并提示切到「全部」，而不是甩一句「还没有记录到调用」。
-（参考实现恰好踩了这个坑：CLI 的窗口写死 24h，历史稍旧就全输出 0，看起来像功能坏了。）
 
 统计口径（写进代码注释并由单元测试约束）：
 
@@ -136,7 +134,7 @@ dashboard 切到 `All`。
 - 缓存命中率 = `cacheRead / (input + cacheRead)`；
 - 成本是**按内置单价的 API 等价估算**，不是账单（Antigravity 是订阅制）。内置单价来自
   Oh My Pi 的内嵌定价表，并用本机真实账单反推的隐含单价交叉验证过；
-- 日桶按**本地时区**对齐（参考实现用 UTC，那会把一天切在早上 8 点）。
+- 日桶按**本地时区**对齐。
 
 数据只落在本机；用量面板的 HTTP 路由与登录路由共用同一套回环校验（Host/Origin +
 浏览器会话），不联网、不外发。
@@ -282,6 +280,27 @@ pnpm pack                  # prepack 会自动 build，产物只含 lib/
 ```
 
 > 改了源码后必须重新构建：运行中的 DSH 与 `dsh list` 消费的是 `lib/` 而不是 `src/`。
+
+### 装进 profile：**每次都要 bump version**
+
+profile 里的依赖是 `file:` 指向 tarball，而 pnpm 把 `file:` 依赖按**路径**判为已满足 ——
+覆盖 tarball 但版本号不变时，它**不会**刷新 `node_modules`。实测（pnpm 12.4，临时目录）：
+
+| 手段（tarball 已换、版本号未变） | 是否装上新内容 |
+|---|---|
+| `pnpm install` | ❌ 报 `Lockfile is up to date, resolution step is skipped` |
+| `pnpm install --force` | ❌ 从 store 复用旧内容（`reused 1, downloaded 0`） |
+| 只删 `node_modules/<pkg>` 再 install | ❌ 内容不变 |
+| 删 `pnpm-lock.yaml` + 整个 `node_modules` 再 add | ✅ |
+| `pnpm store prune` + `install --force` | ✅ |
+| **bump `package.json` 的 version** 后再 add | ✅ |
+
+所以"源码是 0.3.x、装的是 0.2.x"是默认结果，不是意外。两条对策：
+
+1. **发布/安装一律 bump version**（推荐），或用上表后两种补救；
+2. **运行时能问出版本**：插件导出 `version`（从装好的 `package.json` 现读，不会与源码漂移），
+   加载时打一行 `dsh-antigravity: v<版本> 已加载`，`/status` 的回执里也带 `version` ——
+   排查"我改的为什么没生效"时先看这一行，别猜。
 
 测试覆盖：模型解析、凭据记录封装、OAuth URL、请求构造、工具 schema 投影（`const` / 引用关键字 / 接受关键字 / 缺失 schema 兜底 / `buildRequest` 回归）、SSE 解析、用量映射、Cordis 注册（断言目录条目落在 `llm-antigravity` 而非 `llm-pi-ai`）、浏览器半插槽注册；用量侧另有纯函数口径（词元桶 / 成本 / 缓存节省 / 分桶 / 分组 / 百分位）、采集插桩的成功-失败-中止三条路径、SQLite 幂等写入与窗口查询、快照聚合与行数上限、账户门禁与自动统计的触发条件。
 
