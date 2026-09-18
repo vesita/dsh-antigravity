@@ -1844,6 +1844,103 @@ await check('没有任何账号时抛出 MISSING_CREDENTIAL', async () => {
   assert.strictEqual(result.error.code, 'MISSING_CREDENTIAL')
 })
 
+await check('某个端点 429 不会终止端点遍历（配额池按端点独立）', async () => {
+  const pool = makePool()
+  await pool.add(credsOf('a@b.c'))
+  const urls = []
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async url => {
+    urls.push(String(url))
+    if (String(url).includes('sandbox')) return healthySse()
+    return new Response(quotaBody, { status: 429 })
+  }
+  try {
+    const adapter = new GoogleAntigravityAdapter({
+      resolveCredentials: (signal, exclude) => pool.resolve(signal, exclude)
+    })
+    const chunks = []
+    for await (const chunk of adapter.stream({ model: 'gemini-3.8-flash', messages: [{ role: 'user', content: 'hi' }] })) {
+      chunks.push(chunk)
+    }
+    assert.strictEqual(finishOf(chunks).reason.kind, 'stop', '第二个端点可用时这次调用必须成功')
+    assert(urls.some(url => url.includes('daily-cloudcode-pa.googleapis.com')), '第一个端点必须先被尝试')
+    assert(
+      urls.some(url => url.includes('sandbox')),
+      `429 之后必须继续试下一个端点（实测 daily 返回 200 的同一秒 cloudcode-pa 返回 429）: ${JSON.stringify(urls)}`
+    )
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+await check('端点迟迟不返回响应头时被放弃并切到下一个端点', async () => {
+  const pool = makePool()
+  await pool.add(credsOf('a@b.c'))
+  const urls = []
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = (url, init) => {
+    urls.push(String(url))
+    if (String(url).includes('sandbox')) return Promise.resolve(healthySse())
+    // A hang: never answers on its own, only lets go when the attempt aborts.
+    return new Promise((_resolve, reject) => {
+      init.signal.addEventListener('abort', () => reject(new Error('the operation was aborted')))
+    })
+  }
+  try {
+    const adapter = new GoogleAntigravityAdapter({
+      resolveCredentials: (signal, exclude) => pool.resolve(signal, exclude),
+      firstByteTimeoutMs: 40
+    })
+    const started = Date.now()
+    const chunks = []
+    for await (const chunk of adapter.stream({ model: 'gemini-3.8-flash', messages: [{ role: 'user', content: 'hi' }] })) {
+      chunks.push(chunk)
+    }
+    const elapsed = Date.now() - started
+    assert.strictEqual(finishOf(chunks).reason.kind, 'stop', '超时后必须由下一个端点接管')
+    assert(urls.length >= 2, `挂住的端点必须被放弃: ${JSON.stringify(urls)}`)
+    assert(elapsed < 5000, `熔断必须立刻发生，而不是等到底层 TCP 超时: ${elapsed}ms`)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+await check('首包超时只覆盖响应头：头部到达后的长流不会被掐断', async () => {
+  const pool = makePool()
+  await pool.add(credsOf('a@b.c'))
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async () => {
+    const body = new ReadableStream({
+      async start(controller) {
+        const encoder = new TextEncoder()
+        controller.enqueue(
+          encoder.encode(`data: ${JSON.stringify({ response: { candidates: [{ content: { parts: [{ text: 'a' }] } }] } })}\n\n`)
+        )
+        await new Promise(resolve => setTimeout(resolve, 150))
+        controller.enqueue(
+          encoder.encode(`data: ${JSON.stringify({ response: { candidates: [{ finishReason: 'STOP', content: { parts: [] } }] } })}\n\n`)
+        )
+        controller.close()
+      }
+    })
+    return new Response(body, { status: 200 })
+  }
+  try {
+    const adapter = new GoogleAntigravityAdapter({
+      resolveCredentials: (signal, exclude) => pool.resolve(signal, exclude),
+      firstByteTimeoutMs: 30
+    })
+    const chunks = []
+    for await (const chunk of adapter.stream({ model: 'gemini-3.8-flash', messages: [{ role: 'user', content: 'hi' }] })) {
+      chunks.push(chunk)
+    }
+    assert.strictEqual(finishOf(chunks).reason.kind, 'stop', '流必须完整读完，不能被 30ms 的首包超时当成挂起掐断')
+    assert(chunks.some(chunk => chunk.type === 'text-delta'), '第一段内容必须送达')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
 process.env.DSH_HOME = sharedHome
 
 console.log(`\n所有 dsh-antigravity 单元测试通过（${passed} 项）`)

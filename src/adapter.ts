@@ -58,6 +58,23 @@ const MISSING_CREDENTIAL_MESSAGE =
 /** Hard ceiling on how many accounts one call may walk through. */
 const MAX_ACCOUNT_ATTEMPTS = 8
 
+/**
+ * How long one endpoint attempt may take to produce its **response headers**.
+ *
+ * This is a hang breaker, not a generation deadline: the timer is cleared the
+ * instant headers arrive, so a stream that legitimately runs for minutes is
+ * never cut off. It exists because the provider does not always fail fast — a
+ * endpoint that accepts the connection and then never answers would otherwise
+ * hold the call forever, with the two remaining endpoints never tried (the
+ * request does carry the caller's abort signal, but a caller that never aborts
+ * — a headless run — has nothing else to break the wait).
+ *
+ * 120s is two orders of magnitude above a normal time to first byte even while
+ * the provider is queueing hard (measured 12–39s on 2026-09-18), so it fires on
+ * a hang rather than on a slow day.
+ */
+const FIRST_BYTE_TIMEOUT_MS = 120_000
+
 /** One image resolved to inline request bytes. */
 export interface ResolvedImage {
   mimeType: string
@@ -136,6 +153,8 @@ export interface AdapterOptions {
   resolveRetryPolicy?: () => ResolvedRetryPolicy | undefined
   /** Resolve one attachment reference into inline image bytes. */
   resolveImage?: ImageResolver
+  /** Test seam for {@link FIRST_BYTE_TIMEOUT_MS}; production leaves it unset. */
+  firstByteTimeoutMs?: number
   /**
    * Called once per failed account attempt, so the pool can park an exhausted
    * account instead of handing it to the next call.
@@ -447,9 +466,27 @@ export class GoogleAntigravityAdapter extends LlmAdapter {
     signal?: AbortSignal
   ): Promise<Response> {
     let lastError: unknown = null
+    // The first quota rejection, kept separately from `lastError`: a later
+    // endpoint may fail for a reason that says nothing about the account (a
+    // dropped connection), and that must not replace the one failure the user
+    // can act on — nor hide the fact that the pool should try another account.
+    let scopedError: LlmError | null = null
+    const timeoutMs = this.options.firstByteTimeoutMs ?? FIRST_BYTE_TIMEOUT_MS
     for (const base of endpoints) {
       if (signal?.aborted) throw new LlmError('Antigravity 请求已被取消', 'ABORTED')
       const url = `${base.replace(/\/+$/, '')}/v1internal:streamGenerateContent?alt=sse`
+      // The abort controller belongs to this attempt: it forwards the caller's
+      // cancellation (so a mid-stream abort still kills the body) and adds a
+      // headers-only deadline. The outer listener stays attached after the
+      // headers arrive on purpose — the response body outlives this function.
+      const attempt = new AbortController()
+      const forward = () => attempt.abort()
+      let timedOut = false
+      signal?.addEventListener('abort', forward, { once: true })
+      const timer = setTimeout(() => {
+        timedOut = true
+        attempt.abort()
+      }, timeoutMs)
       try {
         const res = await fetch(url, {
           method: 'POST',
@@ -460,8 +497,11 @@ export class GoogleAntigravityAdapter extends LlmAdapter {
             'User-Agent': 'antigravity'
           },
           body: JSON.stringify(payload),
-          signal
+          signal: attempt.signal
         })
+        // Headers are in: the deadline was for the first byte, not for the
+        // answer, so a long generation is no longer on the clock.
+        clearTimeout(timer)
         if (res.ok && res.body) return res
         const body = await res.text().catch(() => '')
         const error = new LlmError(
@@ -474,18 +514,34 @@ export class GoogleAntigravityAdapter extends LlmAdapter {
         if (res.status === 429) {
           const retryAt = parseQuotaResetMs(body)
           if (retryAt !== undefined) error.retryAtMs = retryAt
+          scopedError = scopedError ?? error
         }
         lastError = error
-        // Authentication and quota failures are not endpoint-specific.
-        if (res.status === 401 || res.status === 403 || res.status === 429) break
+        // A rejected grant is rejected by every endpoint of this provider, so
+        // the remaining attempts would only add latency. Quota is *not* shared
+        // the same way: the endpoints keep separate pools — measured live on
+        // 2026-09-18, `daily` answered 200 while `cloudcode-pa` answered 429 in
+        // the same second — so a 429 must not end the walk.
+        if (res.status === 401 || res.status === 403) break
       } catch (error) {
+        clearTimeout(timer)
+        signal?.removeEventListener('abort', forward)
         if (signal?.aborted) throw new LlmError('Antigravity 请求已被取消', 'ABORTED', { cause: error })
+        if (timedOut) {
+          lastError = new LlmError(
+            `Antigravity 端点 ${base} 在 ${Math.round(timeoutMs / 1000)} 秒内没有返回响应头，已放弃该端点`,
+            'TRANSPORT',
+            { cause: error }
+          )
+          continue
+        }
         lastError = error
       }
     }
-    throw lastError instanceof LlmError
-      ? lastError
-      : new LlmError('连接任何 Google Antigravity 端点均失败', 'TRANSPORT', { cause: lastError })
+    const failure = scopedError ?? lastError
+    throw failure instanceof LlmError
+      ? failure
+      : new LlmError('连接任何 Google Antigravity 端点均失败', 'TRANSPORT', { cause: failure })
   }
 }
 

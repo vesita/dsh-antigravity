@@ -771,7 +771,10 @@ check('回填遇缺失的解压器只报告失败，不中断整体', () => {
 // ---------------------------------------------------------------------------
 // 429 的呈现：现场实测（16195 条用量记录）里 429 **全是配额耗尽**，不是瞬时限流，
 // 所以这里既要求把"多久后重置"讲清楚，也用负向对照守住"别给普通 429 乱扣配额帽子"。
-// 同时钉住"只打一次端点"——429 会让端点轮询立刻 break（配额与鉴权都不是端点级的）。
+// 同时钉住"429 会继续走完剩余端点"——配额池是**按端点独立**的：2026-09-18 现场实测，
+// 同一秒里 `daily` 返回 200 而 `cloudcode-pa` 返回 429（同一个账号、同一个 project），
+// 所以 429 一旦 break 就会把一个还能用的端点白白丢掉。鉴权 401/403 仍然立刻收手，
+// 那个确实是端点无关的。
 // ---------------------------------------------------------------------------
 const QUOTA_BODY = JSON.stringify({
   error: {
@@ -799,8 +802,20 @@ check('429 配额耗尽：错误消息说清"配额已用尽 + 何时重置"', (
   assert.ok(/Antigravity 端点/.test(message), '仍指明是哪个端点：' + message)
 })
 
-check('429 时端点轮询立刻收手（鉴权/配额不是端点级故障）', () => {
-  assert.strictEqual(quotaCalls, 1, '只打了一次：' + quotaCalls)
+check('429 会继续试剩余端点（配额池按端点独立），而不是立刻收手', () => {
+  assert.strictEqual(quotaCalls, 3, '默认三个端点都要试过：' + quotaCalls)
+})
+
+let authCalls = 0
+const badToken = await observeCall({
+  fetch: async () => {
+    authCalls += 1
+    return new Response('bad token', { status: 401 })
+  }
+})
+check('401 立刻收手（被拒的凭据在每个端点上都会被拒）', () => {
+  assert.strictEqual(authCalls, 1, '不该为同一个坏 token 打三个端点：' + authCalls)
+  assert.strictEqual(badToken.failure.code, 'INVALID_CREDENTIAL')
 })
 
 check('负向对照：非配额语义的 429 保持原始响应，不被扣上"配额"帽子', async () => {
