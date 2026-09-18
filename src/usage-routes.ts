@@ -76,6 +76,14 @@ export interface UsageSnapshot {
    */
   sessions: UsageGroupView[]
   agents: UsageGroupView[]
+  /**
+   * Per-account totals: "which Google account spent this".
+   *
+   * `key` is the account email as the collector recorded it, or `(unknown)` for
+   * calls that predate the account registry (and every row imported from a
+   * session log, which carries no account).
+   */
+  accounts: UsageGroupView[]
   /** Newest calls in the window, so the first screen costs one request. */
   recent: UsageRequestView[]
   status: UsageStatus
@@ -168,6 +176,16 @@ export function buildSnapshot(
     overview: group.overview
   }))
 
+  // Accounts group by the email that served each call. Rows written before the
+  // account registry existed (and every log-backed historical row) carry no
+  // owner, so they collect under `(unknown)` rather than being dropped —
+  // totals must still add up to the window total.
+  const accounts: UsageGroupView[] = groupBy(records, record => record.account || '(unknown)', pricing).map(group => ({
+    key: group.key,
+    label: group.key,
+    overview: group.overview
+  }))
+
   // Sessions group by the stored session id. `(unknown)` collects rows written before the id was
   // available (backfill gaps) so the group totals still add up to the window total.
   const sessions: UsageGroupView[] = groupBy(records, record => record.sessionId || '(unknown)', pricing).map(group => ({
@@ -192,6 +210,7 @@ export function buildSnapshot(
     projects,
     sessions,
     agents,
+    accounts,
     recent: records.slice(0, 20).map(record => ({
       ...record,
       cost: computeCost(record.tokens, priceOf(record.model, pricing)),

@@ -53,7 +53,7 @@ export interface UsageStoreStats {
 }
 
 /** Schema version recorded in `usage_meta`; bump when the column set changes. */
-export const USAGE_SCHEMA_VERSION = '1'
+export const USAGE_SCHEMA_VERSION = '2'
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS usage_records (
@@ -72,7 +72,8 @@ CREATE TABLE IF NOT EXISTS usage_records (
   cache_read_tokens INTEGER NOT NULL DEFAULT 0,
   cache_write_tokens INTEGER NOT NULL DEFAULT 0,
   reasoning_tokens INTEGER NOT NULL DEFAULT 0,
-  total_tokens INTEGER NOT NULL DEFAULT 0
+  total_tokens INTEGER NOT NULL DEFAULT 0,
+  account TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS usage_records_time ON usage_records(time);
 CREATE INDEX IF NOT EXISTS usage_records_time_model ON usage_records(time, model);
@@ -106,6 +107,7 @@ interface UsageRow {
   cache_write_tokens: number
   reasoning_tokens: number
   total_tokens: number
+  account: string
 }
 
 export class UsageStore {
@@ -126,19 +128,36 @@ export class UsageStore {
     this.#db.exec('PRAGMA journal_mode = WAL')
     this.#db.exec('PRAGMA synchronous = NORMAL')
     this.#db.exec(SCHEMA)
+    this.#migrate()
     this.#insert = this.#db.prepare(`
       INSERT OR IGNORE INTO usage_records (
         key, time, session_id, cwd, model, agent_type, ttft_ms, duration_ms,
         stop_reason, error_message, input_tokens, output_tokens,
-        cache_read_tokens, cache_write_tokens, reasoning_tokens, total_tokens
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        cache_read_tokens, cache_write_tokens, reasoning_tokens, total_tokens,
+        account
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `)
-    if (this.meta('schema') === undefined) this.setMeta('schema', USAGE_SCHEMA_VERSION)
     try {
       chmodSync(file, 0o600)
     } catch {
       /* best effort: a foreign filesystem may refuse */
     }
+  }
+
+  /**
+   * Bring an existing database up to the current column set.
+   *
+   * History is worth keeping — a working deployment has tens of thousands of
+   * rows — so the one column added for multi-account attribution is applied with
+   * `ALTER TABLE` rather than by recreating the table. Rows written before
+   * accounts existed keep `''` and read back as "owner unknown".
+   */
+  #migrate(): void {
+    const columns = this.#db.prepare('PRAGMA table_info(usage_records)').all() as unknown as Array<{ name: string }>
+    if (!columns.some(column => column.name === 'account')) {
+      this.#db.exec("ALTER TABLE usage_records ADD COLUMN account TEXT NOT NULL DEFAULT ''")
+    }
+    if (this.meta('schema') !== USAGE_SCHEMA_VERSION) this.setMeta('schema', USAGE_SCHEMA_VERSION)
   }
 
   /**
@@ -167,7 +186,8 @@ export class UsageStore {
       int(tokens.cacheReadTokens),
       int(tokens.cacheWriteTokens),
       int(tokens.reasoningTokens),
-      int(tokens.totalTokens)
+      int(tokens.totalTokens),
+      record.account || ''
     )
     return Number(result.changes) > 0
   }
@@ -357,6 +377,7 @@ function rowToRecord(row: UsageRow): UsageRecord {
     durationMs: row.duration_ms === null ? null : Number(row.duration_ms),
     stopReason: row.stop_reason || '',
     errorMessage: row.error_message || '',
+    ...(row.account ? { account: row.account } : {}),
     tokens
   }
 }

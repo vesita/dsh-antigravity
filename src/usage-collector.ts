@@ -59,6 +59,9 @@ export class UsageCollector {
     if (this.#enabled !== undefined && this.#enabled() !== true) return false
     try {
       const facts = observation.sessionId === '' ? undefined : this.#safeFacts(observation.sessionId)
+      // The human label, not the registry id: the panel answers "which Google
+      // account spent this", and an email is that answer.
+      const account = observation.accountLabel || observation.accountId || ''
       const record: UsageRecord = {
         time: observation.time,
         sessionId: observation.sessionId,
@@ -69,6 +72,7 @@ export class UsageCollector {
         durationMs: observation.durationMs,
         stopReason: observation.stopReason || 'stop',
         errorMessage: observation.errorMessage || '',
+        ...(account === '' ? {} : { account }),
         tokens: tokensOf(observation.tokens)
       }
       return this.#store.insert(key, record)

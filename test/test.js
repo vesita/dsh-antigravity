@@ -9,6 +9,7 @@ import {
   isExpiring,
   parseRedirectUri,
   readAuthFile,
+  removeAuthFile,
   resolveOAuthClient,
   toGrantRecord,
   writeAuthFile
@@ -508,7 +509,13 @@ await check('card renders a visible sign-in button while signed out', () => {
 await check('card renders the sign-out action while signed in', () => {
   const face = registration.factory(
     requireFace(
-      fakeReact([{ authenticated: true, email: 'a@b.c', projectId: 'proj', timeLeftSeconds: 600 }])
+      fakeReact([
+        {
+          authenticated: true,
+          activeAccountId: 'a1',
+          accounts: [{ id: 'a1', email: 'a@b.c', projectId: 'proj', timeLeftSeconds: 600, active: true }]
+        }
+      ])
     )
   )
   const tree = face.AntigravityCard({
@@ -516,6 +523,41 @@ await check('card renders the sign-out action while signed in', () => {
   })
   const text = textOf(tree).join(' | ')
   assert.match(text, /已登录/)
+  assert.match(text, /退出登录/)
+})
+await check('card lists every account with its own health and default badge', () => {
+  const face = registration.factory(
+    requireFace(
+      fakeReact([
+        {
+          authenticated: true,
+          strategy: 'round-robin',
+          activeAccountId: 'a1',
+          accounts: [
+            { id: 'a1', email: 'a@b.c', projectId: 'proj-1', timeLeftSeconds: 600, active: true },
+            { id: 'a2', email: 'd@e.f', projectId: 'proj-2', cooling: true, cooldownSeconds: 1800, active: false }
+          ]
+        }
+      ])
+    )
+  )
+  const text = textOf(face.AntigravityCard({ provider: { provider: 'google-antigravity' } })).join(' | ')
+  assert.match(text, /2 个账号/, 'the heading must count the pool')
+  assert.match(text, /a@b\.c/, 'every account must be named')
+  assert.match(text, /d@e\.f/)
+  assert.match(text, /默认/, 'the active account must be marked')
+  assert.match(text, /设为默认/, 'the other account must be selectable')
+  assert.match(text, /配额冷却中/, 'a parked account must say so')
+  assert.match(text, /轮询使用/, 'the strategy must be visible')
+})
+await check('card offers adding another account once one is installed', () => {
+  const face = registration.factory(
+    requireFace(
+      fakeReact([{ authenticated: true, activeAccountId: 'a1', accounts: [{ id: 'a1', email: 'a@b.c', active: true }] }])
+    )
+  )
+  const text = textOf(face.AntigravityCard({ provider: { provider: 'google-antigravity' } })).join(' | ')
+  assert.match(text, /添加账号/, 'an installed provider grows by adding, not by signing in again')
   assert.match(text, /退出登录/)
 })
 await check('card ignores rows owned by another provider', () => {
@@ -531,7 +573,7 @@ await check('card says why an attempt ended without a grant', () => {
 })
 await check('the draft copy renders while the provider still has no row', () => {
   const face = registration.factory(
-    requireFace(fakeReact([{ authenticated: true, email: 'a@b.c' }], []))
+    requireFace(fakeReact([{ authenticated: true, accounts: [{ id: 'a1', email: 'a@b.c', active: true }] }], []))
   )
   const text = textOf(
     face.AntigravityCard({
@@ -545,14 +587,11 @@ await check('the draft copy drops out once the marker installs the saved row', (
   // Same instance across both renders: it mounted from the dormant row, then
   // the sign-in wrote `llm-antigravity.account` and the row appeared.
   const refs = []
-  const mounted = registration.factory(
-    requireFace(fakeReact([{ authenticated: true, email: 'a@b.c' }], refs))
-  )
+  const signedIn = [{ authenticated: true, accounts: [{ id: 'a1', email: 'a@b.c', active: true }] }]
+  const mounted = registration.factory(requireFace(fakeReact(signedIn, refs)))
   const dormant = { provider: { provider: 'google-antigravity', settingsNs: 'llm-antigravity' }, configured: false }
   assert.notStrictEqual(mounted.AntigravityCard(dormant), null)
-  const rerendered = registration.factory(
-    requireFace(fakeReact([{ authenticated: true, email: 'a@b.c' }], refs))
-  )
+  const rerendered = registration.factory(requireFace(fakeReact(signedIn, refs)))
   assert.strictEqual(
     rerendered.AntigravityCard({ ...dormant, configured: true }),
     null,
@@ -561,7 +600,14 @@ await check('the draft copy drops out once the marker installs the saved row', (
 })
 await check('the saved row copy keeps its card once configured', () => {
   const face = registration.factory(
-    requireFace(fakeReact([{ authenticated: true, email: 'a@b.c', projectId: 'proj', timeLeftSeconds: 600 }]))
+    requireFace(
+      fakeReact([
+        {
+          authenticated: true,
+          accounts: [{ id: 'a1', email: 'a@b.c', projectId: 'proj', timeLeftSeconds: 600, active: true }]
+        }
+      ])
+    )
   )
   const text = textOf(
     face.AntigravityCard({
@@ -714,12 +760,26 @@ function fakeRes() {
   }
 }
 
-/** Invoke a registered route handler the way the web server would. */
-async function request(method, path) {
+/**
+ * Invoke a registered route handler the way the web server would. A `body`
+ * option is serialized and offered as an async-iterable request stream, which
+ * is what the host's JSON reader consumes.
+ */
+async function request(method, path, options = {}) {
   const route = routes.get(path)
   assert(route, `${path} must be registered`)
   const res = fakeRes()
-  await route.handler({ method, url: path, headers: {} }, res)
+  const encoded = options.body === undefined ? '' : JSON.stringify(options.body)
+  const chunks = encoded === '' ? [] : [Buffer.from(encoded, 'utf8')]
+  const req = {
+    method,
+    url: path,
+    headers: {},
+    async *[Symbol.asyncIterator]() {
+      for (const chunk of chunks) yield chunk
+    }
+  }
+  await route.handler(req, res)
   return { status: res.statusCode, headers: res.headers, body: res.body ? JSON.parse(res.body) : null }
 }
 
@@ -727,10 +787,13 @@ const STATUS = '/dsh-antigravity/auth/status'
 const LOGIN = '/dsh-antigravity/auth/login'
 const CANCEL = '/dsh-antigravity/auth/cancel'
 const LOGOUT = '/dsh-antigravity/auth/logout'
+const ACCOUNTS = '/dsh-antigravity/auth/accounts'
+const ACCOUNTS_ACTIVE = '/dsh-antigravity/auth/accounts/active'
+const ACCOUNTS_REMOVE = '/dsh-antigravity/auth/accounts/remove'
 
-await check('the host registers exactly the four routes the card calls', () => {
+await check('the host registers exactly the routes the card calls', () => {
   const authPaths = [...registeredPaths].filter(entry => entry.startsWith('/dsh-antigravity/auth')).sort()
-  assert.deepStrictEqual(authPaths, [CANCEL, LOGIN, LOGOUT, STATUS])
+  assert.deepStrictEqual(authPaths, [ACCOUNTS, ACCOUNTS_ACTIVE, ACCOUNTS_REMOVE, CANCEL, LOGIN, LOGOUT, STATUS])
   const usagePaths = [...registeredPaths].filter(entry => entry.startsWith('/dsh-antigravity/usage')).sort()
   assert.deepStrictEqual(usagePaths, [
     '/dsh-antigravity/usage/backfill',
@@ -786,6 +849,79 @@ await check('remove: /logout clears the account and closes the loop', async () =
   const after = await request('GET', STATUS)
   assert.strictEqual(after.body.authenticated, false)
   assert.strictEqual(after.body.expired, false)
+})
+
+// ---------------------------------------------------------------------------
+// 多账号路由：列表 / 切换默认 / 逐个移除。两条账号直接写进注册表，因为这一段要考的
+// 是路由本身，签发流程已由第 7 节覆盖。
+// ---------------------------------------------------------------------------
+const { writeAccountRegistry, accountsFilePath } = await import('../lib/accounts.js')
+
+const seededAccount = (id, email, projectId) => ({
+  id,
+  label: email,
+  email,
+  projectId,
+  addedAt: 1,
+  creds: { access: `access-${id}`, refresh: `refresh-${id}`, email, projectId, expires: Date.now() + 3_600_000 }
+})
+
+await check('multi: /accounts lists every account and never a token', async () => {
+  writeAccountRegistry(
+    {
+      version: 1,
+      activeId: 'id-a',
+      accounts: [seededAccount('id-a', 'a@b.c', 'proj-a'), seededAccount('id-b', 'd@e.f', 'proj-b')],
+      updatedAt: 0
+    },
+    accountsFilePath()
+  )
+  const { status, body } = await request('GET', ACCOUNTS)
+  assert.strictEqual(status, 200)
+  assert.strictEqual(body.accounts.length, 2)
+  assert.strictEqual(body.activeAccountId, 'id-a')
+  assert.strictEqual(body.strategy, 'round-robin', 'the default strategy must be reported')
+  assert.ok(!('access' in body.accounts[0]), 'the browser half must never receive a token')
+  assert.ok(!('creds' in body.accounts[0]))
+})
+
+await check('multi: /status reports the active account and the whole pool', async () => {
+  const { body } = await request('GET', STATUS)
+  assert.strictEqual(body.authenticated, true)
+  assert.strictEqual(body.email, 'a@b.c')
+  assert.strictEqual(body.accounts.length, 2)
+})
+
+await check('multi: /accounts/active switches the default and /status follows', async () => {
+  const { status, body } = await request('POST', ACCOUNTS_ACTIVE, { body: { id: 'id-b' } })
+  assert.strictEqual(status, 200)
+  assert.strictEqual(body.activeAccountId, 'id-b')
+  assert.strictEqual(body.email, 'd@e.f')
+  assert.strictEqual(readAuthFile().email, 'd@e.f', 'the legacy mirror must follow the default')
+})
+
+await check('multi: /accounts/active refuses an unknown id', async () => {
+  const { status, body } = await request('POST', ACCOUNTS_ACTIVE, { body: { id: 'nope' } })
+  assert.strictEqual(status, 404)
+  assert.match(body.error, /未找到/)
+})
+
+await check('multi: /logout signs out only the active account', async () => {
+  const { status, body } = await request('POST', LOGOUT)
+  assert.strictEqual(status, 200)
+  assert.strictEqual(body.accounts.length, 1, 'the other account must survive a sign-out')
+  assert.strictEqual(body.authenticated, true)
+  assert.strictEqual(body.email, 'a@b.c', 'the remaining account takes over')
+})
+
+await check('multi: /accounts/remove deletes one and closes the loop on the last', async () => {
+  const removed = await request('POST', ACCOUNTS_REMOVE, { body: { id: 'id-a' } })
+  assert.strictEqual(removed.status, 200)
+  assert.strictEqual(removed.body.accounts.length, 0)
+  assert.strictEqual(removed.body.authenticated, false)
+  assert.strictEqual(readAuthFile(), null)
+  const missing = await request('POST', ACCOUNTS_REMOVE, { body: { id: 'id-a' } })
+  assert.strictEqual(missing.status, 404)
 })
 await check('teardown during a pending attempt releases every route', async () => {
   const { body } = await request('POST', LOGIN)
@@ -1094,5 +1230,316 @@ await check('默认导出带上 name / inject / apply / Config', () => {
   assert.strictEqual(typeof antigravityPlugin.apply, 'function')
   assert.ok(antigravityPlugin.Config)
 })
+
+// ---------------------------------------------------------------------------
+// 多账号：注册表、选择策略、配额冷却、跨账号故障转移。
+//
+// 这一段整体搬进一个独立的 DSH_HOME：它会写注册表与旧镜像，而旧镜像正是
+// `~/.dsh/antigravity-auth.json` —— 跑在共享 home 里会把上面几节的状态搅乱。
+// ---------------------------------------------------------------------------
+console.log('# 13. 多账号注册表、选择策略与跨账号故障转移')
+const { AccountPool, upsertAccount, removeAccountById, adoptLegacy, accountsFilePath: poolPath } = await import(
+  '../lib/accounts.js'
+)
+
+const accountsHome = mkdtempSync(pathJoin(tmpdir(), 'dsh-antigravity-accounts-'))
+const sharedHome = process.env.DSH_HOME
+process.env.DSH_HOME = accountsHome
+
+/** A monotonic fake clock: cooldowns must be judgeable without sleeping. */
+let clock = 1_000_000
+let poolSeq = 0
+/**
+ * A pool with its own registry file.
+ *
+ * The legacy mirror (`antigravity-auth.json`) is deliberately removed first:
+ * it is one shared file, the previous case always leaves its active account in
+ * it, and an empty registry adopts whatever it finds there — so a leftover
+ * would silently become an extra account in the next case.
+ */
+const makePool = (options = {}) => {
+  removeAuthFile()
+  return new AccountPool({
+    file: pathJoin(accountsHome, `registry-${poolSeq++}.json`),
+    now: () => clock,
+    warn: () => {},
+    refresh: async creds => creds,
+    ...options
+  })
+}
+
+const credsOf = (email, overrides = {}) => ({
+  access: `access-${email}`,
+  refresh: `refresh-${email}`,
+  email,
+  accountId: email,
+  projectId: `proj-${email}`,
+  expires: Date.now() + 3_600_000,
+  ...overrides
+})
+
+await check('注册表把同一邮箱的再次登录并入同一条目', () => {
+  const registry = { version: 1, accounts: [], updatedAt: 0 }
+  const first = upsertAccount(registry, credsOf('a@b.c'), 1000)
+  const again = upsertAccount(registry, credsOf('a@b.c', { access: 'access-renewed' }), 2000)
+  assert.strictEqual(registry.accounts.length, 1, 'the same email must not become two accounts')
+  assert.strictEqual(again.id, first.id)
+  assert.strictEqual(again.creds.access, 'access-renewed')
+})
+
+await check('不同邮箱各占一条，互不覆盖', () => {
+  const registry = { version: 1, accounts: [], updatedAt: 0 }
+  upsertAccount(registry, credsOf('a@b.c'), 1000)
+  upsertAccount(registry, credsOf('d@e.f'), 1000)
+  assert.strictEqual(registry.accounts.length, 2)
+})
+
+await check('移除默认账号会把默认指到剩下的账号', () => {
+  const registry = { version: 1, accounts: [], updatedAt: 0 }
+  const a = upsertAccount(registry, credsOf('a@b.c'), 1000)
+  const d = upsertAccount(registry, credsOf('d@e.f'), 1000)
+  registry.activeId = a.id
+  assert.strictEqual(removeAccountById(registry, a.id), true)
+  assert.strictEqual(registry.activeId, d.id)
+  assert.strictEqual(removeAccountById(registry, 'nope'), false)
+})
+
+await check('空注册表会采纳既有凭据（单账号升级为多账号）', () => {
+  const registry = { version: 1, accounts: [], updatedAt: 0 }
+  const entry = adoptLegacy(registry, { access: 'legacy', projectId: 'aicode-consumers' }, 1000)
+  assert(entry, 'an existing grant must be adopted')
+  assert.strictEqual(registry.accounts.length, 1)
+  assert.strictEqual(registry.activeId, entry.id)
+  assert.strictEqual(adoptLegacy({ version: 1, accounts: [], updatedAt: 0 }, null), null)
+})
+
+await check('没有账号时 resolve 返回 undefined', async () => {
+  const pool = makePool()
+  assert.strictEqual(await pool.resolve(), undefined)
+  assert.strictEqual(pool.configured(), false)
+})
+
+await check('round-robin 把连续调用分给不同账号', async () => {
+  const pool = makePool()
+  await pool.add(credsOf('a@b.c'))
+  await pool.add(credsOf('d@e.f'))
+  const seen = []
+  for (let index = 0; index < 4; index += 1) seen.push((await pool.resolve()).email)
+  assert.deepStrictEqual(seen, ['a@b.c', 'd@e.f', 'a@b.c', 'd@e.f'])
+})
+
+await check('active-first 只用默认账号，直到它不可用', async () => {
+  const pool = makePool({ strategy: () => 'active-first' })
+  await pool.add(credsOf('a@b.c'))
+  await pool.add(credsOf('d@e.f'))
+  const seen = []
+  for (let index = 0; index < 3; index += 1) seen.push((await pool.resolve()).email)
+  assert.deepStrictEqual(seen, ['d@e.f', 'd@e.f', 'd@e.f'], 'the active account must be drained first')
+})
+
+await check('配额失败会把账号停到重置时间，下一次调用自动换人', async () => {
+  const pool = makePool({ strategy: () => 'active-first' })
+  await pool.add(credsOf('a@b.c'))
+  await pool.add(credsOf('d@e.f'))
+  const first = await pool.resolve()
+  assert.strictEqual(first.email, 'd@e.f')
+  pool.reportFailure({
+    accountId: first.accountId,
+    kind: 'quota',
+    message: '配额已用尽',
+    cooldownUntil: clock + 3_600_000
+  })
+  const second = await pool.resolve()
+  assert.strictEqual(second.email, 'a@b.c', 'a parked account must not be handed out again')
+  const parked = pool.list().find(view => view.email === 'd@e.f')
+  assert.strictEqual(parked.cooling, true)
+  assert.strictEqual(parked.cooldownSeconds, 3600)
+  assert.match(parked.lastError, /配额/)
+})
+
+await check('账号恢复可用后冷却自动解除', async () => {
+  const pool = makePool()
+  const entry = await pool.add(credsOf('a@b.c'))
+  pool.reportFailure({ accountId: entry.id, kind: 'quota', message: 'q', cooldownUntil: clock + 60_000 })
+  assert.strictEqual(pool.list()[0].cooling, true)
+  clock += 60_001
+  assert.strictEqual(pool.list()[0].cooling, false)
+  const creds = await pool.resolve()
+  assert.strictEqual(creds.email, 'a@b.c', 'a cooled-down account must come back')
+})
+
+await check('全部账号都在冷却时仍交出最早恢复的那个（真实错误不被吞）', async () => {
+  const pool = makePool()
+  const a = await pool.add(credsOf('a@b.c'))
+  const d = await pool.add(credsOf('d@e.f'))
+  pool.reportFailure({ accountId: a.id, kind: 'quota', message: 'q', cooldownUntil: clock + 60_000 })
+  pool.reportFailure({ accountId: d.id, kind: 'quota', message: 'q', cooldownUntil: clock + 600_000 })
+  const creds = await pool.resolve()
+  assert.strictEqual(creds.email, 'a@b.c')
+})
+
+await check('故障转移用的 exclude 会跳过已试过的账号', async () => {
+  const pool = makePool()
+  const a = await pool.add(credsOf('a@b.c'))
+  const d = await pool.add(credsOf('d@e.f'))
+  // The pool keys candidates by registry id, which is what the adapter puts in
+  // `exclude` — passing an email here would exclude nothing.
+  const creds = await pool.resolve(undefined, new Set([a.id]))
+  assert.strictEqual(creds.email, 'd@e.f')
+  assert.strictEqual(await pool.resolve(undefined, new Set([a.id, d.id])), undefined)
+})
+
+await check('clear() 清空全部账号并撤掉旧镜像', async () => {
+  const pool = makePool()
+  await pool.add(credsOf('a@b.c'))
+  assert(readAuthFile(), 'the legacy mirror must exist so the CLI keeps working')
+  await pool.clear()
+  assert.strictEqual(pool.count(), 0)
+  assert.strictEqual(readAuthFile(), null)
+})
+
+await check('注册表为空时会采纳旧镜像里的单个凭据', async () => {
+  // The pool is built first so the grant lands after its empty-world reset,
+  // which is exactly the order an upgrading deployment sees.
+  const pool = makePool()
+  writeAuthFile(credsOf('legacy@x.y'))
+  const creds = await pool.resolve()
+  assert.strictEqual(creds.email, 'legacy@x.y')
+  assert.strictEqual(pool.count(), 1)
+  assert.strictEqual(pool.activeLabel(), 'legacy@x.y')
+})
+
+// ---------------------------------------------------------------------------
+// 适配器侧的故障转移：一次调用穿过多个账号，430/401 换人，传输失败不换。
+// ---------------------------------------------------------------------------
+
+/** Serve one SSE stream of plain text, the shape a healthy answer takes. */
+function healthySse() {
+  const body = new ReadableStream({
+    start(controller) {
+      const encoder = new TextEncoder()
+      const events = [
+        { response: { candidates: [{ content: { parts: [{ text: 'ok' }] } }] } },
+        { response: { candidates: [{ finishReason: 'STOP', content: { parts: [] } }] } }
+      ]
+      for (const event of events) controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`))
+      controller.close()
+    }
+  })
+  return new Response(body, { status: 200 })
+}
+
+/** Run one adapter call against a stubbed network and report what happened. */
+async function runAdapter(fetchImpl, pool) {
+  const originalFetch = globalThis.fetch
+  const seen = []
+  globalThis.fetch = async (url, init) => {
+    const token = String((init && init.headers && init.headers.Authorization) || '')
+    seen.push(token)
+    return fetchImpl(token)
+  }
+  const failures = []
+  try {
+    const adapter = new GoogleAntigravityAdapter({
+      resolveCredentials: (signal, exclude) => pool.resolve(signal, exclude),
+      // Exactly how the mounting plugin wires it: the pool learns about the
+      // failure so the *next* call does not walk into the same account.
+      reportFailure: info => {
+        failures.push(info)
+        pool.reportFailure(info)
+      }
+    })
+    const chunks = []
+    for await (const chunk of adapter.stream({
+      model: 'gemini-3.8-flash',
+      messages: [{ role: 'user', content: 'hi' }]
+    })) {
+      chunks.push(chunk)
+    }
+    return { chunks, seen, failures, error: null }
+  } catch (error) {
+    return { chunks: [], seen, failures, error }
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+}
+
+const quotaBody = '{"error":{"message":"Individual quota reached. Resets in 1h0m0s."}}'
+
+await check('配额 429 后同一次调用换下一个账号并成功', async () => {
+  const pool = makePool()
+  const first = await pool.add(credsOf('a@b.c'))
+  await pool.add(credsOf('d@e.f'))
+  const result = await runAdapter(
+    token => (token.endsWith('access-a@b.c') ? new Response(quotaBody, { status: 429 }) : healthySse()),
+    pool
+  )
+  assert.strictEqual(result.error, null, `the call must succeed on the second account: ${result.error}`)
+  assert(result.seen.some(token => token.endsWith('access-a@b.c')), 'the exhausted account must be tried first')
+  assert(result.seen.some(token => token.endsWith('access-d@e.f')), 'the second account must take over')
+  assert.strictEqual(finishOf(result.chunks).reason.kind, 'stop')
+  assert.strictEqual(result.failures.length, 1)
+  assert.strictEqual(result.failures[0].kind, 'quota')
+  assert.strictEqual(result.failures[0].accountId, first.id)
+  assert(
+    result.failures[0].cooldownUntil > Date.now(),
+    '429 里的 "Resets in 1h0m0s" 必须被解析成冷却时间'
+  )
+  assert.strictEqual(pool.list().find(view => view.email === 'a@b.c').cooling, true)
+})
+
+await check('负控：传输类失败不换账号（换也没用）', async () => {
+  const pool = makePool()
+  await pool.add(credsOf('a@b.c'))
+  await pool.add(credsOf('d@e.f'))
+  const result = await runAdapter(() => new Response('boom', { status: 500 }), pool)
+  assert(result.error, 'a transport failure must surface')
+  assert(
+    result.seen.every(token => token.endsWith('access-a@b.c')),
+    `only the first account may be tried: ${JSON.stringify(result.seen)}`
+  )
+  assert.strictEqual(result.failures.length, 1)
+  assert.strictEqual(result.failures[0].kind, 'other')
+})
+
+await check('全部账号都配额耗尽时抛出的是真实的配额错误', async () => {
+  const pool = makePool()
+  await pool.add(credsOf('a@b.c'))
+  await pool.add(credsOf('d@e.f'))
+  const result = await runAdapter(() => new Response(quotaBody, { status: 429 }), pool)
+  assert(result.error, 'the call must fail')
+  assert.match(result.error.message, /配额已用尽/)
+  assert.strictEqual(result.failures.length, 2, 'both accounts must be reported')
+  assert.strictEqual(pool.list().filter(view => view.cooling).length, 2)
+})
+
+await check('鉴权失败（401）同样换账号', async () => {
+  const pool = makePool()
+  await pool.add(credsOf('a@b.c'))
+  await pool.add(credsOf('d@e.f'))
+  const result = await runAdapter(
+    token => (token.endsWith('access-a@b.c') ? new Response('bad token', { status: 401 }) : healthySse()),
+    pool
+  )
+  assert.strictEqual(result.error, null, `the call must succeed on the second account: ${result.error}`)
+  assert.strictEqual(result.failures[0].kind, 'auth')
+})
+
+await check('单账号时 429 的报错文案与文案断言保持原样', async () => {
+  const pool = makePool()
+  await pool.add(credsOf('a@b.c'))
+  const result = await runAdapter(() => new Response(quotaBody, { status: 429 }), pool)
+  assert.match(result.error.message, /配额已用尽/)
+  assert.match(result.error.message, /1h0m0s/, '重置时间必须留在文案里')
+})
+
+await check('没有任何账号时抛出 MISSING_CREDENTIAL', async () => {
+  const pool = makePool()
+  const result = await runAdapter(() => healthySse(), pool)
+  assert(result.error, 'a call without any account must fail')
+  assert.strictEqual(result.error.code, 'MISSING_CREDENTIAL')
+})
+
+process.env.DSH_HOME = sharedHome
 
 console.log(`\n所有 dsh-antigravity 单元测试通过（${passed} 项）`)

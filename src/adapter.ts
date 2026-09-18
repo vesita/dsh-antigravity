@@ -30,6 +30,12 @@ import type { AntigravityCredentials } from './auth.js'
  * instance valid across live settings edits and makes the class testable
  * without a Cordis context.
  *
+ * One call may walk several accounts. The adapter never decides *which* account
+ * is which: it asks the credential layer for one, and when that account is
+ * rejected for a reason another account would not share (quota, credential) it
+ * reports the failure and asks again with the failed id excluded. The pool
+ * decides who is next.
+ *
  * @module dsh-antigravity/adapter
  */
 
@@ -39,6 +45,18 @@ export const DEFAULT_ENDPOINTS = [
   'https://daily-cloudcode-pa.sandbox.googleapis.com',
   'https://cloudcode-pa.googleapis.com'
 ]
+
+/**
+ * Message DSH shows when no account can serve a call at all.
+ *
+ * Kept as one constant because it is also the text a user reads after every
+ * account in the pool has been tried.
+ */
+const MISSING_CREDENTIAL_MESSAGE =
+  '未找到 google-antigravity 认证凭据。请在 DSH 的「设置 → 模型 → Google Antigravity」中登录后重试。'
+
+/** Hard ceiling on how many accounts one call may walk through. */
+const MAX_ACCOUNT_ATTEMPTS = 8
 
 /** One image resolved to inline request bytes. */
 export interface ResolvedImage {
@@ -73,14 +91,41 @@ export interface CallObservation {
   errorMessage: string
   /** Provider-reported usage, or null when the call never reported any. */
   tokens: TokenUsage | null
+  /** Registry id of the account that served the call, when one was attributed. */
+  accountId?: string
+  /** Human label of that account (its email), when one was attributed. */
+  accountLabel?: string
+  /** How many accounts this one call walked through before it settled. */
+  accountAttempts?: number
+}
+
+/** One account-scoped failure the adapter hands back to the credential pool. */
+export interface AdapterFailureInfo {
+  /** Id of the account that failed. */
+  accountId?: string
+  /** Only `quota` and `auth` are worth another account; `other` is not. */
+  kind: 'quota' | 'auth' | 'other'
+  /** Provider text, kept for the settings card. */
+  message: string
+  /** Reset time of an exhausted quota, epoch ms, when the body carried one. */
+  cooldownUntil?: number
 }
 
 /** Every fact the adapter reads, supplied by the mounting plugin. */
 export interface AdapterOptions {
   /** Active catalog, read fresh on every call so settings edits apply live. */
   resolveModels?: () => ModelSpec[] | undefined
-  /** Credential facts for the provider route. */
-  resolveCredentials?: (signal?: AbortSignal) => Promise<AntigravityCredentials | undefined>
+  /**
+   * Credential facts for the provider route.
+   *
+   * @param signal - abort signal.
+   * @param exclude - accounts already tried for this call, so a failover walks
+   *   the pool rather than returning to the account that just failed.
+   */
+  resolveCredentials?: (
+    signal?: AbortSignal,
+    exclude?: ReadonlySet<string>
+  ) => Promise<AntigravityCredentials | undefined>
   /** Configured endpoint, when settings name one. */
   resolveEndpoint?: () => string | undefined
   /** Configured billing project, when settings name one. */
@@ -91,6 +136,11 @@ export interface AdapterOptions {
   resolveRetryPolicy?: () => ResolvedRetryPolicy | undefined
   /** Resolve one attachment reference into inline image bytes. */
   resolveImage?: ImageResolver
+  /**
+   * Called once per failed account attempt, so the pool can park an exhausted
+   * account instead of handing it to the next call.
+   */
+  reportFailure?: (info: AdapterFailureInfo) => void
   /**
    * Called once per settled call with what the stream reported.
    *
@@ -234,25 +284,69 @@ export class GoogleAntigravityAdapter extends LlmAdapter {
     let finish: FinishReason | undefined
     let failure = ''
     let settled = false
+    let accountId: string | undefined
+    let accountLabel: string | undefined
+    let accountAttempts = 0
 
     try {
       const catalog = this.#catalog()
       const spec = resolveModelSpec(options.model, catalog)
       const wireModel = spec?.wireId || options.model
 
-      const creds = await this.#credentials(options.signal)
       const endpoints = this.#endpoints()
       const request = await buildRequest(options, spec, this.options.resolveImage)
-      const payload = {
-        project: creds.projectId || this.options.resolveProjectId?.() || 'aicode-consumers',
-        model: wireModel,
-        requestId: `agent/${randomUUID()}/${Date.now()}/${randomUUID()}/1`,
-        request,
-        userAgent: 'antigravity',
-        requestType: 'agent'
+      const tried = new Set<string>()
+      let lastError: unknown = null
+      let response: Response | null = null
+
+      // One attempt per account. A quota or credential rejection is neither the
+      // endpoint's fault nor the request's — with a second account installed it
+      // just means the wrong account was picked, so the pool is asked for the
+      // next one instead of surfacing a failure the user cannot act on.
+      for (;;) {
+        const creds = await this.#credentials(options.signal, tried)
+        if (creds === undefined) {
+          if (lastError !== null) throw lastError
+          throw new LlmError(MISSING_CREDENTIAL_MESSAGE, 'MISSING_CREDENTIAL')
+        }
+        const identity = creds.accountId ?? creds.email ?? ''
+        // A credential layer that ignores `exclude` (a lone account, a test
+        // double) would otherwise be asked forever: stop instead of looping.
+        if (tried.size > 0 && (identity === '' || tried.has(identity))) {
+          throw lastError ?? new LlmError(MISSING_CREDENTIAL_MESSAGE, 'MISSING_CREDENTIAL')
+        }
+        if (tried.size >= MAX_ACCOUNT_ATTEMPTS) throw lastError
+        tried.add(identity === '' ? `#${tried.size}` : identity)
+        accountAttempts += 1
+        accountId = creds.accountId ?? accountId
+        accountLabel = creds.email ?? creds.projectId ?? accountLabel
+
+        const payload = {
+          project: creds.projectId || this.options.resolveProjectId?.() || 'aicode-consumers',
+          model: wireModel,
+          requestId: `agent/${randomUUID()}/${Date.now()}/${randomUUID()}/1`,
+          request,
+          userAgent: 'antigravity',
+          requestType: 'agent'
+        }
+
+        try {
+          response = await this.#openStream(endpoints, creds.access, payload, options.signal)
+          break
+        } catch (error) {
+          lastError = error
+          try {
+            this.options.reportFailure?.(failureInfoOf(creds, error))
+          } catch {
+            /* accounting must never break a model call */
+          }
+          // A transport or request failure repeats identically on every
+          // account, so it is reported as-is.
+          if (!accountScoped(error)) throw error
+          if (options.signal?.aborted) throw error
+        }
       }
 
-      const response = await this.#openStream(endpoints, creds.access, payload, options.signal)
       for await (const chunk of parseStream(response, spec)) {
         // Time to first token measures the first piece of model output. Usage
         // and finish chunks are bookkeeping, and a block-start carries no
@@ -285,7 +379,10 @@ export class GoogleAntigravityAdapter extends LlmAdapter {
             durationMs: Date.now() - startedAt,
             stopReason: failure !== '' ? 'error' : settled ? String(finish?.kind ?? 'stop') : 'aborted',
             errorMessage: failure,
-            tokens: usage
+            tokens: usage,
+            ...(accountId === undefined ? {} : { accountId }),
+            ...(accountLabel === undefined ? {} : { accountLabel }),
+            ...(accountAttempts > 1 ? { accountAttempts } : {})
           })
         } catch {
           /* accounting must never break a model call */
@@ -294,17 +391,25 @@ export class GoogleAntigravityAdapter extends LlmAdapter {
     }
   }
 
-  async #credentials(signal?: AbortSignal): Promise<AntigravityCredentials> {
+  /**
+   * Ask the credential layer for an account.
+   *
+   * @param signal - abort signal.
+   * @param exclude - accounts already tried for this call.
+   * @returns credential facts, or `undefined` when nothing is left to try.
+   */
+  async #credentials(
+    signal?: AbortSignal,
+    exclude?: ReadonlySet<string>
+  ): Promise<AntigravityCredentials | undefined> {
     try {
-      const creds = await this.options.resolveCredentials?.(signal)
-      if (!creds || !creds.access) throw new Error('no credentials')
+      const creds = await this.options.resolveCredentials?.(signal, exclude)
+      if (!creds || !creds.access) return undefined
       return creds
     } catch (error) {
-      throw new LlmError(
-        '未找到 google-antigravity 认证凭据。请在 DSH 的「设置 → 模型 → Google Antigravity」中登录后重试。',
-        'MISSING_CREDENTIAL',
-        { cause: error }
-      )
+      if (error instanceof LlmError) throw error
+      if (signal?.aborted) throw new LlmError('Antigravity 请求已被取消', 'ABORTED', { cause: error })
+      throw new LlmError(MISSING_CREDENTIAL_MESSAGE, 'MISSING_CREDENTIAL', { cause: error })
     }
   }
 
@@ -340,10 +445,18 @@ export class GoogleAntigravityAdapter extends LlmAdapter {
         })
         if (res.ok && res.body) return res
         const body = await res.text().catch(() => '')
-        lastError = new LlmError(
+        const error = new LlmError(
           res.status === 429 ? quotaMessage(base, res.status, body) : `Antigravity 端点 ${base} 返回 ${res.status}: ${body.slice(0, 500)}`,
           httpCode(res.status)
-        )
+        ) as LlmError & { retryAtMs?: number }
+        // A 429 body usually says when the quota resets. Keep that as a fact on
+        // the error so the pool can park this account for exactly that long
+        // instead of guessing, and so the next call goes elsewhere.
+        if (res.status === 429) {
+          const retryAt = parseQuotaResetMs(body)
+          if (retryAt !== undefined) error.retryAtMs = retryAt
+        }
+        lastError = error
         // Authentication and quota failures are not endpoint-specific.
         if (res.status === 401 || res.status === 403 || res.status === 429) break
       } catch (error) {
@@ -355,6 +468,54 @@ export class GoogleAntigravityAdapter extends LlmAdapter {
       ? lastError
       : new LlmError('连接任何 Google Antigravity 端点均失败', 'TRANSPORT', { cause: lastError })
   }
+}
+
+/**
+ * Whether a failure is specific to the *account* rather than to the request,
+ * the endpoints, or the network.
+ *
+ * Only these are worth another account: a request the endpoint rejected is
+ * rejected identically by every account, and retrying it would multiply a bad
+ * request by the size of the pool.
+ *
+ * @param error - the failure a stream attempt produced.
+ * @returns whether the pool should be asked for the next account.
+ */
+function accountScoped(error: unknown): boolean {
+  const code = (error as { code?: unknown } | null | undefined)?.code
+  return code === 'QUOTA_EXCEEDED' || code === 'INVALID_CREDENTIAL'
+}
+
+/** Project one failed attempt into the fact the credential pool records. */
+function failureInfoOf(creds: AntigravityCredentials, error: unknown): AdapterFailureInfo {
+  const code = (error as { code?: unknown } | null | undefined)?.code
+  const kind: AdapterFailureInfo['kind'] =
+    code === 'QUOTA_EXCEEDED' ? 'quota' : code === 'INVALID_CREDENTIAL' ? 'auth' : 'other'
+  const retryAt = (error as { retryAtMs?: unknown } | null | undefined)?.retryAtMs
+  return {
+    ...(creds.accountId === undefined ? {} : { accountId: creds.accountId }),
+    kind,
+    message: error instanceof Error ? error.message : String(error),
+    ...(kind === 'quota' && typeof retryAt === 'number' ? { cooldownUntil: retryAt } : {})
+  }
+}
+
+/**
+ * Read the quota reset delay out of a 429 body.
+ *
+ * Google states it in prose — `Resets in 1h31m29s` — and that is the only place
+ * the fact exists, so it is parsed rather than guessed at. Anything unexpected
+ * returns `undefined` and leaves the pool to its conservative default.
+ *
+ * @param body - raw 429 response text.
+ * @param now - clock, epoch ms.
+ * @returns the reset instant, epoch ms, or `undefined` when the body is silent.
+ */
+export function parseQuotaResetMs(body: string, now: number = Date.now()): number | undefined {
+  const match = /Resets in\s+(?:([0-9]+)h)?(?:([0-9]+)m)?(?:([0-9]+(?:\.[0-9]+)?)s)?/i.exec(String(body || ''))
+  if (match === null) return undefined
+  const ms = Math.round((Number(match[1] || 0) * 3600 + Number(match[2] || 0) * 60 + Number(match[3] || 0)) * 1000)
+  return ms > 0 ? now + ms : undefined
 }
 
 function httpCode(status: number): string {
@@ -378,6 +539,10 @@ function httpCode(status: number): string {
  * failures into `dsh-llm-retry`'s retryable set and spend the retry budget on a
  * wait measured in minutes-to-hours. Surfacing the wait is the useful fix; the
  * raw body is kept (truncated) so nothing is hidden.
+ *
+ * The parsed reset instant also travels on the error (`retryAtMs`) so the
+ * multi-account pool can park this account for exactly that long — and with a
+ * second account installed, the call itself already moved on to it.
  *
  * @param base - endpoint that answered.
  * @param status - HTTP status (always 429 here).

@@ -251,6 +251,9 @@ console.log('# 6. 持久化、采集与快照')
 const { mkdtempSync } = await import('node:fs')
 const { tmpdir } = await import('node:os')
 const { join } = await import('node:path')
+// Hand-built databases below need the raw driver: one case opens a database
+// written by the previous schema version.
+const { DatabaseSync } = await import('node:sqlite')
 const storeDir = mkdtempSync(join(tmpdir(), 'dsh-antigravity-usage-'))
 const store = new UsageStore(join(storeDir, 'usage.db'))
 
@@ -288,6 +291,73 @@ check('store 元数据往返', () => {
   store.setMeta('schema', '1')
   assert.strictEqual(store.meta('schema'), '1')
   assert.strictEqual(store.meta('missing'), undefined)
+})
+
+check('store 记录并读回服务调用的账号', () => {
+  const probe = new UsageStore(':memory:')
+  probe.insert('k-acct-1', record({ time: 10, account: 'a@b.c' }))
+  probe.insert('k-acct-2', record({ time: 11 }))
+  const rows = probe.query({})
+  assert.strictEqual(rows.find(row => row.time === 10).account, 'a@b.c')
+  assert.strictEqual(
+    'account' in rows.find(row => row.time === 11),
+    false,
+    '没有账号的行不得被编造一个'
+  )
+  probe.close()
+})
+
+check('旧库（无 account 列）打开时自动补列，历史行全部保留', () => {
+  // The one migration this plugin performs on someone's existing usage
+  // database. A deployment that has been recording since before multi-account
+  // keeps every row and gains an empty owner column.
+  const legacyPath = join(storeDir, 'legacy.db')
+  const legacy = new DatabaseSync(legacyPath)
+  legacy.exec(`CREATE TABLE usage_records (
+    key TEXT PRIMARY KEY,
+    time INTEGER NOT NULL,
+    session_id TEXT NOT NULL DEFAULT '',
+    cwd TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    agent_type TEXT NOT NULL DEFAULT 'main',
+    ttft_ms INTEGER,
+    duration_ms INTEGER,
+    stop_reason TEXT NOT NULL DEFAULT '',
+    error_message TEXT NOT NULL DEFAULT '',
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+    total_tokens INTEGER NOT NULL DEFAULT 0
+  )`)
+  legacy.exec('CREATE TABLE usage_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+  legacy.exec('CREATE TABLE usage_files (path TEXT PRIMARY KEY, mtime_ms REAL NOT NULL, size INTEGER NOT NULL)')
+  legacy.exec("INSERT INTO usage_records (key, time, model, total_tokens) VALUES ('old-1', 100, 'gemini-3.8-flash', 42)")
+  legacy.exec("INSERT INTO usage_meta (key, value) VALUES ('schema', '1')")
+  legacy.close()
+
+  const upgraded = new UsageStore(legacyPath)
+  const rows = upgraded.query({})
+  assert.strictEqual(rows.length, 1, '历史行必须留着')
+  assert.strictEqual(rows[0].tokens.totalTokens, 42)
+  assert.strictEqual('account' in rows[0], false, '升级前写入的行没有主，不许编一个')
+  assert.strictEqual(upgraded.meta('schema'), '2', 'schema 版本必须升到 2')
+  assert.strictEqual(upgraded.insert('new-1', record({ time: 200, account: 'd@e.f' })), true, '补列后必须能继续写')
+  assert.strictEqual(upgraded.query({})[0].account, 'd@e.f')
+  upgraded.close()
+})
+
+check('快照按账号分组，未记录账号的历史归入 (unknown)', () => {
+  const probe = new UsageStore(':memory:')
+  probe.insert('k-a1', record({ time: 1_000_000, account: 'a@b.c' }))
+  probe.insert('k-a2', record({ time: 1_000_001, account: 'a@b.c' }))
+  probe.insert('k-a3', record({ time: 1_000_002, account: 'd@e.f' }))
+  probe.insert('k-a4', record({ time: 1_000_003 }))
+  const snapshot = buildSnapshot(probe, DEFAULT_PRICING, 'all', { now: 1_000_004 })
+  const byKey = Object.fromEntries(snapshot.accounts.map(row => [row.key, row.overview.requests]))
+  assert.deepStrictEqual(byKey, { 'a@b.c': 2, 'd@e.f': 1, '(unknown)': 1 })
+  probe.close()
 })
 
 check('buildSnapshot 汇总窗口内的记录', () => {

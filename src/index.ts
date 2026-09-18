@@ -7,15 +7,10 @@ import path from 'node:path'
 import { GoogleAntigravityAdapter } from './adapter.js'
 import type { ResolvedImage } from './adapter.js'
 import { LoginManager } from './auth-flow.js'
-import {
-  CREDENTIAL_KEY,
-  clearCredentials,
-  getValidCredentials,
-  loadCredentials,
-  saveCredentials,
-  writeCredentialRecord
-} from './auth.js'
+import { CREDENTIAL_KEY, dshHome, writeCredentialRecord } from './auth.js'
 import type { AntigravityCredentials, CredentialsSeam } from './auth.js'
+import { AccountPool } from './accounts.js'
+import type { AccountStrategy, AccountView } from './accounts.js'
 import { MODEL_CATALOG, MODEL_MODALITIES, REASONING_EFFORTS } from './models.js'
 import type { ModelSpec } from './models.js'
 import { createProxyServer } from './proxy.js'
@@ -25,7 +20,6 @@ import { DEFAULT_PRICING, registerUsageRoutes } from './usage-routes.js'
 import { backfillFromSessions } from './usage-backfill.js'
 import { UsageStore } from './usage-store.js'
 import type { ModelPrice } from './usage-model.js'
-import { dshHome } from './auth.js'
 
 /**
  * DSH host plugin for the Google Antigravity provider route.
@@ -96,6 +90,16 @@ interface AntigravitySettings {
    * it when the account is removed.
    */
   account?: string
+  /**
+   * How the credential pool picks between installed accounts.
+   *
+   * `round-robin` spreads consecutive calls across every ready account, which
+   * is what keeps one subscription's quota from being spent while another sits
+   * idle; `active-first` drains the active account and only then moves on. Both
+   * park an account whose quota the provider says is exhausted and both fail
+   * over mid-call.
+   */
+  accountStrategy?: AccountStrategy
   models?: ModelSpec[]
   endpoint?: string
   projectId?: string
@@ -158,6 +162,12 @@ interface StatusPayload {
   loginUrl?: string | null
   error?: string | null
   expired?: boolean
+  /** Every installed account, secret-free, in registry order. */
+  accounts?: AccountView[]
+  /** Id of the account a fresh sign-in landed on. */
+  activeAccountId?: string | null
+  /** How the pool orders accounts that are all ready. */
+  strategy?: AccountStrategy
 }
 
 const modelSchema = z.object({
@@ -181,6 +191,7 @@ const priceOverrideSchema = z.object({
 
 export const Config = z.object({
   account: z.string(),
+  accountStrategy: z.union(['round-robin', 'active-first']).default('round-robin'),
   models: z.array(modelSchema).default(MODEL_CATALOG),
   endpoint: z.string().default('https://daily-cloudcode-pa.googleapis.com'),
   projectId: z.string(),
@@ -301,8 +312,23 @@ export function apply(ctx: any, config: AntigravitySettings = {}): void {
     redirectUri: current().redirectUri
   })
 
-  const resolveCredentials = (signal?: AbortSignal): Promise<AntigravityCredentials> =>
-    getValidCredentials(credentialsService(), { ...oauthOptions(), signal })
+  /**
+   * The only credential reader on the model route.
+   *
+   * It owns the account list, refreshes what is about to expire, parks what the
+   * provider said is exhausted, and hands the adapter one account per attempt —
+   * which is what makes a second Google account a failover target rather than
+   * just a second row in settings.
+   */
+  const pool = new AccountPool({
+    credentials: credentialsService,
+    oauth: () => ({ clientId: current().clientId, clientSecret: current().clientSecret }),
+    strategy: () => current().accountStrategy ?? 'round-robin',
+    warn: (message: string) => ctx.logger?.warn?.(message)
+  })
+
+  const resolveCredentials = (signal?: AbortSignal, exclude?: ReadonlySet<string>) =>
+    pool.resolve(signal, exclude)
 
   const resolveImage = async (ref: ImageRef, signal?: AbortSignal): Promise<ResolvedImage | null> => {
     const attachments = ctx.get('attachments')
@@ -318,14 +344,26 @@ export function apply(ctx: any, config: AntigravitySettings = {}): void {
   // Account marker (the provider row's installation record)
   // -------------------------------------------------------------------------
   /**
+   * Label the provider row carries. With several accounts installed the active
+   * one still names the row, and the count says the row stands for more than
+   * that one account.
+   */
+  const markerLabel = (): string => {
+    const count = pool.count()
+    const active = pool.activeLabel()
+    if (active === undefined || active === '') return 'google'
+    return count > 1 ? `${active}（共 ${count} 个账号）` : active
+  }
+
+  /**
    * Publish the settings marker that installs the provider row. Without it the
    * entry stays dormant in the 「添加提供方」 select, which is the default state:
    * a provider nobody signed in to owns no row in Settings → Models.
    */
-  const markAccountInstalled = async (creds: AntigravityCredentials): Promise<void> => {
+  const markAccountInstalled = async (): Promise<void> => {
     const settings = settingsService()
     if (settings === undefined) return
-    const label = creds.email || creds.projectId || 'google'
+    const label = markerLabel()
     if (current().account === label) return
     try {
       await settings.mutate(NS, [{ op: 'set', path: ['account'], value: label }])
@@ -351,7 +389,7 @@ export function apply(ctx: any, config: AntigravitySettings = {}): void {
   /**
    * Keep the marker and the grant in step. The marker *is* how the account is
    * installed, so its removal — this plugin's 退出登录, the row's native
-   * 「移除」, or a hand edit of `settings.yaml` — removes the grant too.
+   * 「移除」, or a hand edit of `settings.yaml` — removes every account too.
    *
    * Only the set → unset transition counts: a grant installed by the standalone
    * CLI never had a marker, and an unrelated settings edit must not delete it.
@@ -360,7 +398,7 @@ export function apply(ctx: any, config: AntigravitySettings = {}): void {
     const account = current().account
     const removed = previousAccount !== undefined && account === undefined
     previousAccount = account
-    if (removed) void clearCredentials(credentialsService())
+    if (removed) void pool.clear()
   }
 
   // -------------------------------------------------------------------------
@@ -369,8 +407,10 @@ export function apply(ctx: any, config: AntigravitySettings = {}): void {
   const login = new LoginManager({
     ...oauthOptions(),
     onSuccess: async (creds: AntigravityCredentials) => {
-      await saveCredentials(credentialsService(), creds)
-      await markAccountInstalled(creds)
+      // Signing in again with an email already on file refreshes that entry
+      // instead of adding a duplicate; a new email appends one.
+      await pool.add(creds)
+      await markAccountInstalled()
     }
   })
   ctx.effect(() => () => login.dispose(), 'dsh-antigravity: login manager')
@@ -386,6 +426,9 @@ export function apply(ctx: any, config: AntigravitySettings = {}): void {
     resolveReasoningEffort: () => current().reasoningEffort,
     resolveRetryPolicy: () => current().retryPolicy,
     resolveImage,
+    // A quota or credential rejection is the pool's problem, not the call's:
+    // reporting it parks that account so the next call does not walk into it.
+    reportFailure: info => pool.reportFailure(info),
     // Recording is a side effect of serving a call: the collector swallows its
     // own failures, so a broken database can never break the model route.
     observe: observation => {
@@ -490,9 +533,10 @@ export function apply(ctx: any, config: AntigravitySettings = {}): void {
         session.notify({ message: '请在浏览器中打开此链接完成 Google 账号授权。', url })
         const creds = await login.completion()
         if (!creds) throw new Error('登录未完成')
+        await pool.add(creds)
         // The seam verifies the record was committed during this attempt.
         await writeCredentialRecord(credentialsService(), creds)
-        await markAccountInstalled(creds)
+        await markAccountInstalled()
       }
     })
   })
@@ -511,45 +555,68 @@ export function apply(ctx: any, config: AntigravitySettings = {}): void {
       return true
     }
 
+    /** Whole-pool snapshot shared by every status-shaped response. */
+    const poolSnapshot = () => ({
+      version,
+      accounts: pool.list(),
+      activeAccountId: pool.activeId() ?? null,
+      strategy: pool.strategy()
+    })
+
     const status = async (): Promise<StatusPayload> => {
       const snapshot = login.status()
+      const base = { ...poolSnapshot(), pending: snapshot.pending, loginUrl: snapshot.url }
       try {
         // Resolve (and refresh, when possible) so the card never claims a live
-        // session on the strength of an expired access token.
-        const creds = await getValidCredentials(credentialsService(), oauthOptions())
+        // session on the strength of an expired access token. The *active*
+        // account is read, not a rotated one: opening settings must not spend a
+        // round-robin turn.
+        const creds = await pool.resolveActive()
+        if (creds === undefined) throw new Error('未找到 google-antigravity 认证凭据')
         // An account installed outside this card — a grant the CLI wrote, or one
         // that predates the marker — has no row to sit in. Reading the card is
         // the moment that becomes visible, so install the marker here rather
         // than writing settings during plugin load.
-        await markAccountInstalled(creds)
+        await markAccountInstalled()
         return {
+          ...base,
           authenticated: true,
-          version,
           email: creds.email ?? null,
           projectId: creds.projectId ?? 'aicode-consumers',
           expires: typeof creds.expires === 'number' ? creds.expires : null,
           timeLeftSeconds: typeof creds.expires === 'number' ? Math.max(0, Math.round((creds.expires - Date.now()) / 1000)) : null,
-          pending: snapshot.pending,
-          loginUrl: snapshot.url,
           error: null
         }
       } catch (error) {
-        let stored: AntigravityCredentials | null = null
-        try {
-          stored = await loadCredentials(credentialsService())
-        } catch {
-          stored = null
-        }
+        const accounts = base.accounts
         return {
+          ...base,
           authenticated: false,
-          version,
-          expired: Boolean(stored?.access),
-          email: stored?.email ?? null,
-          projectId: stored?.projectId ?? null,
-          pending: snapshot.pending,
-          loginUrl: snapshot.url,
+          // A stored account that no longer resolves is the "expired" state the
+          // card used to derive from a leftover grant.
+          expired: accounts.length > 0,
+          email: accounts[0]?.email ?? null,
+          projectId: accounts[0]?.projectId ?? null,
           error: snapshot.error ?? error.message
         }
+      }
+    }
+
+    /** Read a JSON request body, capped so a stray client cannot balloon memory. */
+    const readJsonBody = async (req: IncomingMessage): Promise<any> => {
+      const chunks: Buffer[] = []
+      let size = 0
+      for await (const chunk of req) {
+        const buffer = Buffer.from(chunk as any)
+        size += buffer.length
+        if (size > 64 * 1024) return {}
+        chunks.push(buffer)
+      }
+      if (chunks.length === 0) return {}
+      try {
+        return JSON.parse(Buffer.concat(chunks).toString('utf8'))
+      } catch {
+        return {}
       }
     }
 
@@ -601,6 +668,18 @@ export function apply(ctx: any, config: AntigravitySettings = {}): void {
       `dsh-antigravity: POST ${ROUTE_PREFIX}/cancel`
     )
 
+    /**
+     * Keep the settings marker in step with the account list after a change.
+     *
+     * The provider row survives while any account remains; only the last
+     * removal withdraws the marker, which is what makes the row disappear and
+     * the next sign-in start from 「添加提供方」 again.
+     */
+    const afterAccountChange = async (): Promise<void> => {
+      if (pool.count() === 0) await unmarkAccount()
+      else await markAccountInstalled()
+    }
+
     webCtx.effect(
       () =>
         webCtx.webServer.register({
@@ -610,14 +689,72 @@ export function apply(ctx: any, config: AntigravitySettings = {}): void {
             if (guard(req, res)) return
             if (req.method !== 'POST') return methodNotAllowed(res, 'POST')
             login.cancel()
-            await clearCredentials(credentialsService())
-            // Closing the loop: without the marker the provider row goes away,
-            // so the next sign-in starts from 「添加提供方」 again.
-            await unmarkAccount()
-            sendJson(res, 200, { authenticated: false })
+            // Signs the *active* account out and leaves the rest installed:
+            // with several accounts, 「退出登录」 on one row must not silently
+            // discard the others.
+            await pool.signOut()
+            await afterAccountChange()
+            sendJson(res, 200, await status())
           }
         }),
       `dsh-antigravity: POST ${ROUTE_PREFIX}/logout`
+    )
+
+    webCtx.effect(
+      () =>
+        webCtx.webServer.register({
+          kind: 'exact',
+          path: `${ROUTE_PREFIX}/accounts`,
+          handler: async (req: IncomingMessage, res: ServerResponse) => {
+            if (guard(req, res)) return
+            if (req.method !== 'GET') return methodNotAllowed(res, 'GET')
+            await pool.ready()
+            sendJson(res, 200, poolSnapshot())
+          }
+        }),
+      `dsh-antigravity: GET ${ROUTE_PREFIX}/accounts`
+    )
+
+    webCtx.effect(
+      () =>
+        webCtx.webServer.register({
+          kind: 'exact',
+          path: `${ROUTE_PREFIX}/accounts/active`,
+          handler: async (req: IncomingMessage, res: ServerResponse) => {
+            if (guard(req, res)) return
+            if (req.method !== 'POST') return methodNotAllowed(res, 'POST')
+            const body = await readJsonBody(req)
+            const id = typeof body?.id === 'string' ? body.id : ''
+            if (id === '' || !(await pool.setActive(id))) {
+              sendJson(res, 404, { error: '未找到该账号' })
+              return
+            }
+            await markAccountInstalled()
+            sendJson(res, 200, await status())
+          }
+        }),
+      `dsh-antigravity: POST ${ROUTE_PREFIX}/accounts/active`
+    )
+
+    webCtx.effect(
+      () =>
+        webCtx.webServer.register({
+          kind: 'exact',
+          path: `${ROUTE_PREFIX}/accounts/remove`,
+          handler: async (req: IncomingMessage, res: ServerResponse) => {
+            if (guard(req, res)) return
+            if (req.method !== 'POST') return methodNotAllowed(res, 'POST')
+            const body = await readJsonBody(req)
+            const id = typeof body?.id === 'string' ? body.id : ''
+            if (id === '' || !(await pool.remove(id))) {
+              sendJson(res, 404, { error: '未找到该账号' })
+              return
+            }
+            await afterAccountChange()
+            sendJson(res, 200, await status())
+          }
+        }),
+      `dsh-antigravity: POST ${ROUTE_PREFIX}/accounts/remove`
     )
 
     // -----------------------------------------------------------------------
@@ -642,8 +779,8 @@ export function apply(ctx: any, config: AntigravitySettings = {}): void {
         authenticated: async () => {
           if (current().account !== undefined) return true
           try {
-            const stored = await loadCredentials(credentialsService())
-            return Boolean(stored?.access)
+            await pool.ready()
+            return pool.configured()
           } catch {
             return false
           }

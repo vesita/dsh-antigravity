@@ -264,6 +264,14 @@ export interface UsageRecord {
   stopReason: string
   /** Provider error text, empty on success. */
   errorMessage: string
+  /**
+   * Google account that served the call, as its email.
+   *
+   * Absent for history recorded before the account registry existed: a re-scan
+   * of session logs cannot know which account a past call went out on, and
+   * inventing one would be worse than admitting it is unknown.
+   */
+  account?: string
   /** Token buckets as the provider reported them. */
   tokens: UsageTokens
 }

@@ -4,13 +4,14 @@ import path from 'node:path'
 
 /**
  * Google Antigravity OAuth: endpoints, client resolution, token exchange and
- * refresh, and the two credential stores this plugin owns.
+ * refresh, and the single-grant stores this plugin writes.
  *
- * Credential ownership (the important part): DSH's `ctx.credentials` record
- * seam is the source of truth when a Cordis context provides it, and a private
- * `~/.dsh/antigravity-auth.json` (mode 0600) is the standalone fallback used by
- * the CLI and by a proxy launched outside a DSH process. Nothing here reads or
- * writes another application's database.
+ * This module is deliberately **mechanism only**: it reads and writes one grant
+ * in the `ctx.credentials` record seam and in the private
+ * `~/.dsh/antigravity-auth.json` (mode 0600), and it knows how to refresh it.
+ * Which grant to use, out of how many, and what to do when one is exhausted is
+ * policy — that lives in `accounts.ts`. Nothing here reads or writes another
+ * application's database.
  *
  * @module dsh-antigravity/auth
  */
@@ -41,6 +42,12 @@ export interface AntigravityCredentials {
   authorizedAt?: number
   /** Which credential layer produced these facts. */
   source?: string
+  /**
+   * Registry id of the account these facts belong to, stamped by
+   * `AccountPool`. Absent on credentials read straight from the legacy layers
+   * (environment, a lone record), where there is only one account anyway.
+   */
+  accountId?: string
 }
 
 /** Minimal structural view of the `ctx.credentials` record seam. */
@@ -250,57 +257,29 @@ export function removeAuthFile(): void {
 }
 
 // ---------------------------------------------------------------------------
-// Layered load / persist
+// Identity
 // ---------------------------------------------------------------------------
 
 /**
- * Load credentials, most authoritative layer first:
- * 1. `GOOGLE_ANTIGRAVITY_DATA` / `GOOGLE_ANTIGRAVITY_TOKEN` environment,
- * 2. the `ctx.credentials` grant record,
- * 3. the private mirror file.
+ * Human-readable identity of a grant, for account labels and the settings
+ * marker. This is the one definition of "what do we call this account".
  *
- * @param credentials - optional `ctx.credentials` service.
- * @returns credential facts, or `null` when the route is not signed in.
+ * @param creds - credential facts.
+ * @returns the email when Google reported one, else the project, else `google`.
  */
-export async function loadCredentials(credentials?: CredentialsSeam | null): Promise<AntigravityCredentials | null> {
-  const fromEnv = loadEnvCredentials()
-  if (fromEnv) return fromEnv
-
-  const fromRecord = await readCredentialRecord(credentials)
-  if (fromRecord && fromRecord.access) return fromRecord
-
-  return readAuthFile()
+export function accountLabelOf(creds: AntigravityCredentials | null | undefined): string {
+  if (creds === null || creds === undefined) return 'google'
+  return creds.email || creds.projectId || 'google'
 }
 
 /**
- * Persist credentials to the record seam when available, and to the private
- * mirror as well so the CLI and a standalone proxy stay in sync. Both stores
- * live under the user's own home; neither touches another application.
+ * Credentials supplied entirely through the environment, when present. The
+ * multi-account pool treats them as a synthetic account that outranks the
+ * stored ones and is never persisted.
  *
- * @param credentials - optional `ctx.credentials` service.
- * @param creds - credential facts to persist.
+ * @returns credential facts, or `null` when no environment grant is set.
  */
-export async function saveCredentials(
-  credentials: CredentialsSeam | undefined | null,
-  creds: AntigravityCredentials
-): Promise<void> {
-  if (credentials !== undefined && credentials !== null) {
-    try {
-      await writeCredentialRecord(credentials, creds)
-    } catch {
-      /* fall through to the file so a seam failure never loses the grant */
-    }
-  }
-  writeAuthFile(creds)
-}
-
-/** Remove credentials from every store this plugin owns. */
-export async function clearCredentials(credentials?: CredentialsSeam | null): Promise<void> {
-  await deleteCredentialRecord(credentials)
-  removeAuthFile()
-}
-
-function loadEnvCredentials(): AntigravityCredentials | null {
+export function loadEnvCredentials(): AntigravityCredentials | null {
   const raw = nonEmpty(process.env.GOOGLE_ANTIGRAVITY_DATA)
   if (raw) {
     try {
@@ -481,36 +460,6 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
     }
     signal?.addEventListener('abort', onAbort, { once: true })
   })
-}
-
-/**
- * Resolve usable credentials for a request, refreshing in place when the
- * access token is at or near expiry and a refresh token is available.
- *
- * @param credentials - optional `ctx.credentials` service.
- * @param options - `{ clientId, clientSecret, signal }`.
- * @returns credential facts.
- * @throws when no credential layer has anything to offer.
- */
-export async function getValidCredentials(
-  credentials?: CredentialsSeam | null,
-  options: OAuthRequestOptions = {}
-): Promise<AntigravityCredentials> {
-  const creds = await loadCredentials(credentials)
-  if (!creds || !creds.access) {
-    throw new Error(
-      '未找到 google-antigravity 认证凭据。请在 DSH 的「设置 → 模型 → Google Antigravity」中登录，' +
-        '或运行 "dsh-antigravity login"，或设置 GOOGLE_ANTIGRAVITY_TOKEN 环境变量。'
-    )
-  }
-
-  if (isExpiring(creds) && creds.refresh) {
-    await refreshAccessToken(creds, options)
-    await saveCredentials(credentials, creds)
-  }
-
-  if (!creds.projectId) creds.projectId = 'aicode-consumers'
-  return creds
 }
 
 /**

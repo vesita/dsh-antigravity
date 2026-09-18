@@ -10,19 +10,36 @@
     const h = React.createElement
 
     /**
-     * Browser half of dsh-antigravity: the provider card's sign-in area in
+     * Browser half of dsh-antigravity: the provider card's account manager in
      * Settings → Models.
      *
      * It renders inside the `settings.models.provider-card` keyed slot for the
      * `llm-antigravity` settings namespace and talks to the host over the
-     * loopback routes the host half registers. No secrets cross the wire: the
-     * host owns the OAuth exchange and stores the grant in `ctx.credentials`.
+     * loopback routes the host half registers: every installed Google account
+     * with its own health, plus adding one, choosing the default, and signing
+     * one out. No secrets cross the wire — the host owns the OAuth exchange and
+     * keeps the grants in its account registry.
      *
      * Every element is built with `React.createElement`, whose trailing
      * arguments are children. The automatic `jsx`/`jsxs` runtime instead reads
      * children from `props.children` and treats its third argument as the key,
      * so calling it in `createElement` shape silently renders empty elements.
      */
+    /** One installed account as the host publishes it (never a secret). */
+    interface AccountRow {
+      id: string
+      label?: string | null
+      email?: string | null
+      projectId?: string | null
+      expires?: number | null
+      timeLeftSeconds?: number | null
+      expired?: boolean
+      cooling?: boolean
+      cooldownSeconds?: number | null
+      active?: boolean
+      lastError?: string | null
+    }
+
     /** Payload of the host's `/dsh-antigravity/auth/status` route. */
     interface Status {
       authenticated?: boolean
@@ -34,6 +51,10 @@
       timeLeftSeconds?: number | null
       loginUrl?: string | null
       error?: string | null
+      /** Every installed account, in registry order. */
+      accounts?: AccountRow[]
+      activeAccountId?: string | null
+      strategy?: string
     }
 
     /** Locale strings this card renders. */
@@ -51,6 +72,16 @@
       minutes: string
       retry: string
       failed: string
+      accountsUnit: string
+      addAccount: string
+      setActive: string
+      active: string
+      cooling: string
+      recoversIn: string
+      account: string
+      strategyRoundRobin: string
+      strategyActiveFirst: string
+      strategyPrefix: string
     }
 
     const ROUTE = '/dsh-antigravity/auth'
@@ -72,7 +103,17 @@
           expires: '令牌有效',
           minutes: '分钟',
           retry: '重试',
-          failed: '操作失败'
+          failed: '操作失败',
+          accountsUnit: '个账号',
+          addAccount: '添加账号',
+          setActive: '设为默认',
+          active: '默认',
+          cooling: '配额冷却中',
+          recoversIn: '约',
+          account: 'Google 账号',
+          strategyRoundRobin: '轮询使用',
+          strategyActiveFirst: '优先默认账号',
+          strategyPrefix: '策略'
         }
       : {
           signedIn: 'Signed in',
@@ -87,14 +128,24 @@
           expires: 'Token valid for',
           minutes: 'min',
           retry: 'Retry',
-          failed: 'Request failed'
+          failed: 'Request failed',
+          accountsUnit: 'accounts',
+          addAccount: 'Add account',
+          setActive: 'Make default',
+          active: 'Default',
+          cooling: 'Quota cooling',
+          recoversIn: 'back in ~',
+          account: 'Google account',
+          strategyRoundRobin: 'Round-robin',
+          strategyActiveFirst: 'Active first',
+          strategyPrefix: 'Strategy'
         }
 
     async function call(path: string, init?: RequestInit): Promise<any> {
-      const response = await fetch(`${ROUTE}${path}`, {
-        headers: { accept: 'application/json' },
-        ...init
-      })
+      const headers: Record<string, string> = { accept: 'application/json' }
+      if (init && init.body !== undefined) headers['content-type'] = 'application/json'
+      if (init && init.headers) Object.assign(headers, init.headers as Record<string, string>)
+      const response = await fetch(`${ROUTE}${path}`, Object.assign({}, init, { headers }))
       let payload: any = {}
       try {
         payload = await response.json()
@@ -113,7 +164,26 @@
       label: { fontSize: '12px', lineHeight: '18px', color: 'var(--dsw-alias-label-secondary)' },
       hint: { fontSize: '12px', lineHeight: '18px', color: 'var(--dsw-alias-label-secondary)', opacity: '0.75' },
       error: { fontSize: '12px', lineHeight: '18px', color: 'var(--dsw-alias-state-error-primary)', margin: 0 },
-      link: { fontSize: '12px', lineHeight: '18px', color: 'var(--dsw-alias-brand-primary)' }
+      link: { fontSize: '12px', lineHeight: '18px', color: 'var(--dsw-alias-brand-primary)' },
+      spacer: { flex: '1 1 auto' },
+      // One account per block, separated from its neighbour by a hairline so a
+      // list of five reads as five rows rather than one wrapped paragraph.
+      account: {
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '2px',
+        padding: '6px 0',
+        borderTop: '1px solid var(--dsw-alias-border-l1)'
+      },
+      badge: {
+        fontSize: '11px',
+        lineHeight: '16px',
+        padding: '0 6px',
+        borderRadius: '999px',
+        color: 'var(--dsw-alias-brand-primary)',
+        border: '1px solid var(--dsw-alias-brand-primary)'
+      },
+      detail: { fontSize: '12px', lineHeight: '18px', color: 'var(--dsw-alias-label-secondary)', opacity: '0.75' }
     }
 
     function AntigravityCard(props: any) {
@@ -212,6 +282,7 @@
       // the same status and actions, so dropping this copy loses nothing.
       if (draftCopy && props != null && props.configured === true) return null
 
+      const accounts: AccountRow[] = status != null && Array.isArray(status.accounts) ? status.accounts : []
       const authenticated = status != null && status.authenticated === true
       const pending = status != null && status.pending === true
       const expired = status != null && status.expired === true
@@ -221,18 +292,19 @@
       // surface the reason unless the status line already says it.
       const notice =
         status != null && !authenticated && !pending && !expired && status.error ? String(status.error) : null
-      const minutes =
-        status == null || status.timeLeftSeconds == null
-          ? null
-          : Math.max(0, Math.round(status.timeLeftSeconds / 60))
 
-      const identity = authenticated
-        ? [copy.signedIn, status.email, status.projectId ? `${copy.project}: ${status.projectId}` : null]
-            .filter(Boolean)
-            .join(' · ')
-        : expired
-          ? copy.expired
-          : copy.signedOut
+      // The heading counts accounts rather than naming one: with several
+      // installed, no single identity describes the provider any more, and each
+      // row below carries its own.
+      const heading = pending
+        ? copy.waiting
+        : accounts.length > 0
+          ? accounts.length === 1
+            ? copy.signedIn
+            : `${copy.signedIn} · ${accounts.length} ${copy.accountsUnit}`
+          : expired
+            ? copy.expired
+            : copy.signedOut
 
       const head = h(
         'div',
@@ -247,11 +319,95 @@
                 : 'var(--dsw-alias-state-error-primary)'
           })
         }),
-        h('span', { key: 'label', style: styles.label }, identity),
-        minutes !== null && authenticated
-          ? h('span', { key: 'exp', style: styles.hint }, `${copy.expires} ~${minutes} ${copy.minutes}`)
+        h('span', { key: 'label', style: styles.label }, heading),
+        accounts.length > 1
+          ? h(
+              'span',
+              { key: 'strategy', style: styles.hint },
+              `${copy.strategyPrefix}：${status!.strategy === 'active-first' ? copy.strategyActiveFirst : copy.strategyRoundRobin}`
+            )
           : null
       )
+
+      /** Ask the host to make one account the default. */
+      const chooseAccount = (id: string) =>
+        run(() => call('/accounts/active', { method: 'POST', body: JSON.stringify({ id }) }))
+
+      /** Sign one account out; the other accounts stay installed. */
+      const removeAccount = (id: string) =>
+        run(() => call('/accounts/remove', { method: 'POST', body: JSON.stringify({ id }) }))
+
+      /**
+       * One installed account: identity, health, and what can be done to it.
+       *
+       * The dot is per account on purpose — a pool whose second account is
+       * quota-parked is exactly the state this card exists to show, and a single
+       * provider-level dot cannot express it.
+       */
+      const accountRow = (account: AccountRow, index: number) => {
+        const cooling = account.cooling === true
+        const accountExpired = account.expired === true
+        const cooldownMinutes =
+          typeof account.cooldownSeconds === 'number' ? Math.max(1, Math.round(account.cooldownSeconds / 60)) : null
+        const leftMinutes =
+          typeof account.timeLeftSeconds === 'number' ? Math.max(0, Math.round(account.timeLeftSeconds / 60)) : null
+        const state = cooling
+          ? `${copy.cooling}${cooldownMinutes === null ? '' : `，${copy.recoversIn}${cooldownMinutes} ${copy.minutes}`}`
+          : accountExpired
+            ? copy.expired
+            : leftMinutes === null
+              ? null
+              : `${copy.expires} ~${leftMinutes} ${copy.minutes}`
+        const detail = [account.projectId ? `${copy.project}: ${account.projectId}` : null, state]
+          .filter(Boolean)
+          .join(' · ')
+        return h(
+          'div',
+          { key: account.id || String(index), style: styles.account },
+          h(
+            'div',
+            { style: styles.row },
+            h('span', {
+              key: 'dot',
+              style: Object.assign({}, styles.dot, {
+                background: cooling
+                  ? 'var(--dsw-alias-state-warn-primary)'
+                  : accountExpired
+                    ? 'var(--dsw-alias-state-error-primary)'
+                    : 'var(--dsw-alias-state-success-primary)'
+              })
+            }),
+            h('span', { key: 'who', style: styles.label }, account.email || account.label || copy.account),
+            account.active === true ? h('span', { key: 'badge', style: styles.badge }, copy.active) : null,
+            h('span', { key: 'spacer', style: styles.spacer }),
+            account.active === true
+              ? null
+              : h(
+                  Button,
+                  {
+                    key: 'use',
+                    variant: 'outline',
+                    size: 'sm',
+                    disabled: busy,
+                    onClick: () => chooseAccount(account.id)
+                  },
+                  copy.setActive
+                ),
+            h(
+              Button,
+              {
+                key: 'out',
+                variant: 'outline',
+                size: 'sm',
+                disabled: busy,
+                onClick: () => removeAccount(account.id)
+              },
+              copy.signOut
+            )
+          ),
+          detail === '' ? null : h('div', { style: styles.detail }, detail)
+        )
+      }
 
       const actions = pending
         ? h(
@@ -286,35 +442,26 @@
         : h(
             'div',
             { style: styles.row },
-            authenticated
-              ? h(
-                  Button,
-                  {
-                    key: 'out',
-                    variant: 'outline',
-                    size: 'sm',
-                    disabled: busy,
-                    onClick: () => run(() => call('/logout', { method: 'POST' }))
-                  },
-                  copy.signOut
-                )
-              : h(
-                  Button,
-                  {
-                    key: 'in',
-                    variant: 'primary',
-                    size: 'sm',
-                    disabled: busy,
-                    onClick: startLogin
-                  },
-                  copy.signIn
-                )
+            h(
+              Button,
+              {
+                key: 'in',
+                // The first account is the primary action; every later one is
+                // an addition to a provider that is already installed.
+                variant: accounts.length === 0 ? 'primary' : 'outline',
+                size: 'sm',
+                disabled: busy,
+                onClick: startLogin
+              },
+              accounts.length === 0 ? copy.signIn : copy.addAccount
+            )
           )
 
       return h(
         'div',
         { style: styles.wrap, 'data-dsh-antigravity': 'card' },
         head,
+        accounts.length > 0 ? h('div', null, accounts.map(accountRow)) : null,
         actions,
         notice ? h('p', { key: 'notice', style: styles.hint }, notice) : null,
         error ? h('p', { key: 'error', style: styles.error }, `${copy.failed}: ${error}`) : null
@@ -350,6 +497,7 @@
           trend: '请求趋势',
           byModel: '按模型',
           byProject: '按项目',
+          byAccount: '按账号',
           bySession: '按会话',
           recent: '最近请求',
           refresh: '刷新',
@@ -358,6 +506,7 @@
           noData: '暂无数据',
           model: '模型',
           project: '项目',
+          account: '账号',
           session: '会话',
           calls: '请求',
           tokens: '词元',
@@ -399,6 +548,7 @@
           trend: 'Request trend',
           byModel: 'By model',
           byProject: 'By project',
+          byAccount: 'By account',
           bySession: 'By session',
           recent: 'Recent requests',
           refresh: 'Refresh',
@@ -407,6 +557,7 @@
           noData: 'No data',
           model: 'Model',
           project: 'Project',
+          account: 'Account',
           session: 'Session',
           calls: 'Calls',
           tokens: 'Tokens',
@@ -838,6 +989,18 @@
         { key: 'cost', label: usageCopy.cost, align: 'right', render: (row: any) => fmtCost(row.overview.cost.total) }
       ]
 
+      // Accounts read like projects, only the first column changes meaning: the
+      // question is "which Google account spent this" now that there can be
+      // several. `(unknown)` is where pre-registry rows land.
+      const accountColumns = [
+        { key: 'account', label: usageCopy.account, render: (row: any) => row.label },
+        { key: 'calls', label: usageCopy.calls, align: 'right', render: (row: any) => fmtInt(row.overview.requests) },
+        { key: 'tokens', label: usageCopy.tokens, align: 'right', render: (row: any) => fmtTokens(row.overview.tokens.totalTokens) },
+        { key: 'rate', label: usageCopy.cacheRate, align: 'right', render: (row: any) => fmtPct(row.overview.cacheRate) },
+        { key: 'errors', label: usageCopy.errors, align: 'right', render: (row: any) => fmtPct(row.overview.errorRate) },
+        { key: 'cost', label: usageCopy.cost, align: 'right', render: (row: any) => fmtCost(row.overview.cost.total) }
+      ]
+
       // 会话维度跟项目维度同形，只换第一列的标签来源（sessionLabel 已把长 id 缩短）。
       const sessionColumns = [
         { key: 'session', label: usageCopy.session, render: (row: any) => row.label },
@@ -934,6 +1097,12 @@
           { style: usageStyles.panel },
           h('div', { style: usageStyles.panelTitle }, usageCopy.byProject),
           h(UsageTable, { columns: projectColumns, rows: data.projects })
+        ),
+        h(
+          'div',
+          { style: usageStyles.panel },
+          h('div', { style: usageStyles.panelTitle }, usageCopy.byAccount),
+          h(UsageTable, { columns: accountColumns, rows: data.accounts || [], empty: usageCopy.noData })
         ),
         h(
           'div',
