@@ -769,6 +769,55 @@ check('回填遇缺失的解压器只报告失败，不中断整体', () => {
 })
 
 // ---------------------------------------------------------------------------
+// 双计：实时记录与日志副本是同一次调用的两个视图。两边的键天生不会撞（一个随机
+// uuid、一个 `sessionId:seq`），所以只能按「哪一次调用」来认——会话 + 令牌数 +
+// 60 秒内的时间。写的时候拦（observedCall），已经写进库的按同一条规则删掉
+// （pruneObservedTwins），否则面板上每一个数字都是两倍。
+// ---------------------------------------------------------------------------
+
+const dedupe = new UsageStore(join(storeDir, 'dedupe.db'))
+const tokens15 = addTokens(emptyTokens(), { inputTokens: 10, outputTokens: 5 })
+
+check('实时行与日志副本按会话 + 令牌数 + 时间窗认作同一次调用', () => {
+  dedupe.insert('live-1', record({ sessionId: 's1', time: 1000, ttftMs: 120, tokens: tokens15 }))
+  assert.strictEqual(dedupe.isObservedTwin('s1', tokens15, 1035), true, '日志行比实时行晚 35ms，正是现场实测的偏差')
+  assert.strictEqual(dedupe.isObservedTwin('s1', tokens15, 120_000), false, '时间窗之外不算同一次调用')
+  assert.strictEqual(
+    dedupe.isObservedTwin('s1', addTokens(emptyTokens(), { inputTokens: 99, outputTokens: 5 }), 1010),
+    false,
+    '令牌数不同就不是同一次调用'
+  )
+  assert.strictEqual(dedupe.isObservedTwin('s2', tokens15, 1000), false, '别的会话不算')
+})
+
+check('pruneObservedTwins 只删有实时孪生的日志副本', () => {
+  dedupe.insert('s1:1', record({ sessionId: 's1', time: 1035, tokens: tokens15 }))
+  dedupe.insert('s1:2', record({ sessionId: 's1', time: 600_000, tokens: tokens15 }))
+  dedupe.insert('s1:3', record({ sessionId: 's1', time: 1010, tokens: addTokens(emptyTokens(), { inputTokens: 99, outputTokens: 5 }) }))
+  dedupe.insert('s2:1', record({ sessionId: 's2', time: 1000, tokens: tokens15 }))
+  assert.strictEqual(dedupe.pruneObservedTwins(), 1, '只有 s1:1 有实时孪生')
+  assert.deepStrictEqual(
+    dedupe.query({}).map(row => `${row.sessionId}:${row.time}`).sort(),
+    ['s1:1000', 's1:1010', 's1:600000', 's2:1000'],
+    '实时行、装插件之前的历史、以及只有日志的会话都必须留下'
+  )
+  assert.strictEqual(dedupe.pruneObservedTwins(), 0, '同一条规则必须幂等')
+  dedupe.close()
+})
+
+const observedSkip = await backfillFromSessions({
+  sessionsRoot,
+  provider: 'google-antigravity',
+  importRow: () => true,
+  observedCall: rec => rec.sessionId === 'sess-a' && rec.time === 1000
+})
+
+check('回填跳过已被实时记录的同一次调用', () => {
+  assert.strictEqual(observedSkip.duplicates, 1, '实时记过的那一条必须被跳过')
+  assert.strictEqual(observedSkip.imported, 0, '不能把同一次调用写成第二行')
+})
+
+// ---------------------------------------------------------------------------
 // 429 的呈现：现场实测（16195 条用量记录）里 429 **全是配额耗尽**，不是瞬时限流，
 // 所以这里既要求把"多久后重置"讲清楚，也用负向对照守住"别给普通 429 乱扣配额帽子"。
 // 同时钉住"429 会继续走完剩余端点"——配额池是**按端点独立**的：2026-09-18 现场实测，

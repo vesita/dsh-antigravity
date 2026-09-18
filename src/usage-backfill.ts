@@ -50,6 +50,16 @@ export interface BackfillOptions {
   isCurrent?: (path: string, mtimeMs: number, size: number) => boolean
   /** Remember a file at this revision once its events have been folded in. */
   markProcessed?: (path: string, mtimeMs: number, size: number) => void
+  /**
+   * Whether this call was already recorded while it ran.
+   *
+   * Live observation and this scan are two views of the same call, and their
+   * row keys cannot collide (a fresh uuid against `sessionId:seq`), so without
+   * this check every call the plugin watched would be counted twice. Supplying
+   * it makes the scan import only what live recording could not see: history
+   * from before the plugin was installed.
+   */
+  observedCall?: (record: UsageRecord) => boolean
 }
 
 /** Outcome of one import pass. */
@@ -62,6 +72,8 @@ export interface BackfillResult {
   matched: number
   /** Rows newly written (already-present rows are skipped). */
   imported: number
+  /** Events left alone because live recording already accounted for the call. */
+  duplicates: number
   /** Files skipped because their revision was already folded in. */
   unchanged: number
   /** Files that could not be read, with the reason. */
@@ -78,7 +90,7 @@ const CANDIDATE_FILES = ['session.v3.jsonl.zstd', 'session.v3.jsonl']
  * @returns counts, including the files that could not be read.
  */
 export async function backfillFromSessions(options: BackfillOptions): Promise<BackfillResult> {
-  const result: BackfillResult = { files: 0, scanned: 0, matched: 0, imported: 0, unchanged: 0, failed: [] }
+  const result: BackfillResult = { files: 0, scanned: 0, matched: 0, imported: 0, duplicates: 0, unchanged: 0, failed: [] }
   const files = await listSessionFiles(options.sessionsRoot)
   const binary = options.zstdBinary ?? 'zstd'
   const maxBytes = options.maxBytesPerFile ?? 128 * 1024 * 1024
@@ -148,6 +160,13 @@ export async function backfillFromSessions(options: BackfillOptions): Promise<Ba
         errorMessage: '',
         tokens: tokensOf(data.usage)
       }
+      // The log copy of a call the plugin already watched live is not new
+      // information: counting both doubles every figure on the panel.
+      if (options.observedCall?.(record) === true) {
+        result.duplicates += 1
+        continue
+      }
+
       const key = `${sessionId}:${event.seq === undefined ? `${record.time}` : event.seq}`
       if (options.importRow(key, record)) result.imported += 1
     }

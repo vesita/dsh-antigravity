@@ -777,21 +777,28 @@ export function apply(ctx: any, config: AntigravitySettings = {}): void {
          * actually moved gets decompressed.
          */
         backfill: async () => {
+          // Heal first, then import. The rule that recognises the log copy of an
+          // observed call also removes the copies written before it existed —
+          // without that, a database that grew up doubled stays doubled.
+          const pruned = store.pruneObservedTwins()
           const result = await backfillFromSessions({
             sessionsRoot: path.join(dshHome(), 'sessions'),
             provider: PROVIDER,
             importRow: (key, record) => collector?.import(key, record) ?? false,
             isCurrent: (file, mtimeMs, size) => store.isFileCurrent(file, mtimeMs, size),
-            markProcessed: (file, mtimeMs, size) => store.markFile(file, mtimeMs, size)
+            markProcessed: (file, mtimeMs, size) => store.markFile(file, mtimeMs, size),
+            observedCall: record => store.isObservedTwin(record.sessionId, record.tokens, record.time)
           })
           ctx.logger?.info?.(
-            `dsh-antigravity: 用量统计扫描 ${result.files} 个会话文件（跳过 ${result.unchanged}，导入 ${result.imported}，匹配 ${result.matched}）`
+            `dsh-antigravity: 用量统计扫描 ${result.files} 个会话文件（跳过 ${result.unchanged}，导入 ${result.imported}，去重 ${result.duplicates + pruned}，匹配 ${result.matched}）`
           )
           return {
             imported: result.imported,
             scanned: result.scanned,
             files: result.files,
             matched: result.matched,
+            duplicates: result.duplicates,
+            pruned,
             failed: result.failed.length
           }
         },

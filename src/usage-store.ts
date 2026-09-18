@@ -60,6 +60,16 @@ export interface UsageStoreStats {
 /** Schema version recorded in `usage_meta`; bump when the column set changes. */
 export const USAGE_SCHEMA_VERSION = '2'
 
+/**
+ * How far apart a live row and its log copy may sit and still describe one call.
+ *
+ * They are written within milliseconds of each other (measured 35–60ms: the
+ * stream ends, then DSH appends the message), so the window only has to absorb
+ * that skew. It is deliberately far below the gap between two calls of one
+ * session, and the token counts carry the identity anyway.
+ */
+const TWIN_WINDOW_MS = 60_000
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS usage_records (
   key TEXT PRIMARY KEY,
@@ -281,6 +291,72 @@ export class UsageStore {
       bytes = null
     }
     return { total: Number(row.total) || 0, firstTime: row.first ?? null, lastTime: row.last ?? null, sessions: Number(row.sessions) || 0, bytes }
+  }
+
+  /**
+   * Whether a call the session log reports was already recorded while it ran.
+   *
+   * A live observation and the log line it later produces are two views of one
+   * call: the plugin writes the first as the stream ends (keyed by a fresh
+   * uuid, carrying the first-byte time), the history scan writes the second from
+   * the session log (keyed by `sessionId:seq`, carrying no timing). Their keys
+   * can never collide, so the log copy is recognised by *what the call was* —
+   * the session, the token counts, and a time within {@link TWIN_WINDOW_MS}.
+   *
+   * @param sessionId - session the call belongs to.
+   * @param tokens - token counts the log reports for the call.
+   * @param time - log timestamp of the call, epoch ms.
+   * @returns whether an observed row already accounts for this call.
+   */
+  isObservedTwin(sessionId: string, tokens: UsageTokens | undefined, time: number): boolean {
+    if (this.#closed || sessionId === '') return false
+    const at = Math.round(time)
+    const row = this.#db
+      .prepare(
+        `SELECT 1 FROM usage_records
+          WHERE session_id = ? AND ttft_ms IS NOT NULL
+            AND input_tokens = ? AND output_tokens = ?
+            AND time BETWEEN ? AND ?
+          LIMIT 1`
+      )
+      .get(sessionId, int(tokens?.inputTokens), int(tokens?.outputTokens), at - TWIN_WINDOW_MS, at + TWIN_WINDOW_MS)
+    return row !== undefined
+  }
+
+  /**
+   * Delete the log copies of calls that were already recorded live.
+   *
+   * The scan runs on every panel open, so before this rule existed each call
+   * ended up as two rows and every figure on the panel — requests, tokens, cost
+   * — was doubled. The rule is applied by {@link isObservedTwin} when *writing*,
+   * which stops the duplication; this method applies the same rule to the rows
+   * already written, so a database that grew up doubled heals on the next scan
+   * instead of staying wrong forever.
+   *
+   * Only rows the scan wrote are candidates (`ttft_ms IS NULL` — a live row
+   * always carries a first-byte time), so live accounting is never touched, and
+   * history from before the plugin observed calls has no twin to match and is
+   * kept.
+   *
+   * @returns how many duplicate rows were removed.
+   */
+  pruneObservedTwins(): number {
+    if (this.#closed) return 0
+    const result = this.#db
+      .prepare(
+        `DELETE FROM usage_records
+          WHERE ttft_ms IS NULL AND session_id <> ''
+            AND EXISTS (
+              SELECT 1 FROM usage_records AS live
+               WHERE live.session_id = usage_records.session_id
+                 AND live.ttft_ms IS NOT NULL
+                 AND live.input_tokens = usage_records.input_tokens
+                 AND live.output_tokens = usage_records.output_tokens
+                 AND live.time BETWEEN usage_records.time - ? AND usage_records.time + ?
+            )`
+      )
+      .run(TWIN_WINDOW_MS, TWIN_WINDOW_MS)
+    return Number(result.changes) || 0
   }
 
   /**
