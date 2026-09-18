@@ -32,6 +32,11 @@ export interface UsageQuery {
   cwd?: string
   agentType?: string
   sessionId?: string
+  /**
+   * Google account that served the call, as the collector recorded it (the
+   * email). `''` selects the rows written before accounts existed.
+   */
+  account?: string
   /** Only calls whose stop reason counts as a failure. */
   errorsOnly?: boolean
   /** Newest-first cap; omitted means every matching row. */
@@ -157,7 +162,11 @@ export class UsageStore {
     if (!columns.some(column => column.name === 'account')) {
       this.#db.exec("ALTER TABLE usage_records ADD COLUMN account TEXT NOT NULL DEFAULT ''")
     }
-    if (this.meta('schema') !== USAGE_SCHEMA_VERSION) this.setMeta('schema', USAGE_SCHEMA_VERSION)
+    // Recorded version only ever moves forward: a database already written by a
+    // newer build must not be relabelled by an older one, or the version stops
+    // meaning "which columns this file has".
+    const recorded = Number(this.meta('schema'))
+    if (!(recorded >= Number(USAGE_SCHEMA_VERSION))) this.setMeta('schema', USAGE_SCHEMA_VERSION)
   }
 
   /**
@@ -245,6 +254,12 @@ export class UsageStore {
     if (query.sessionId) {
       where.push('session_id = ?')
       params.push(query.sessionId)
+    }
+    // `account: ''` is a meaningful filter — it selects the rows written before
+    // accounts existed — so this checks for `undefined` rather than for truth.
+    if (query.account !== undefined) {
+      where.push('account = ?')
+      params.push(query.account)
     }
     if (query.errorsOnly) where.push("lower(stop_reason) = 'error'")
 

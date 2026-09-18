@@ -120,12 +120,16 @@ if (command === 'status') {
     console.log('已清除全部账号凭据（', accountsFilePath(), '与旧镜像 ~/.dsh/antigravity-auth.json）')
   }
 } else if (command === 'refresh') {
-  console.log('正在刷新 Google OAuth 令牌...')
+  // A specific account can be refreshed by id, which is also how a grant that
+  // arrived without an email learns (and de-duplicates) its identity.
+  const target = flag('account', '')
+  console.log(target === '' ? '正在刷新默认账号的 OAuth 令牌...' : `正在刷新账号 ${target} 的 OAuth 令牌...`)
   try {
-    const updated = await pool.refreshNow()
-    if (!updated) throw new Error('未找到本地凭据，请先登录')
+    const updated = await pool.refreshNow(target === '' ? undefined : target)
+    if (!updated) throw new Error(target === '' ? '未找到本地凭据，请先登录' : `未找到账号 ${target}`)
     console.log('刷新成功！账号:', updated.email || '(未知)')
     console.log('新过期时间:', new Date(updated.expires).toLocaleString())
+    printAccounts()
   } catch (error) {
     console.error('刷新失败:', error.message)
     process.exit(1)
@@ -154,5 +158,6 @@ if (command === 'status') {
   console.log('  dsh-antigravity logout --account <id>    只清除某个账号')
   console.log('  dsh-antigravity status                   查看认证状态与可用模型列表')
   console.log('  dsh-antigravity refresh                  强制刷新默认账号的 OAuth 令牌')
+  console.log('  dsh-antigravity refresh --account <id>   只刷新某个账号，顺带补齐它的邮箱身份')
   console.log('  dsh-antigravity proxy [--port N]         启动 OpenAI 兼容代理服务')
 }

@@ -239,7 +239,7 @@ export function buildSnapshot(
 export function buildRequests(
   store: UsageStore,
   pricing: Record<string, ModelPrice>,
-  query: { range?: UsageRange; limit?: number; errorsOnly?: boolean; model?: string; cwd?: string }
+  query: { range?: UsageRange; limit?: number; errorsOnly?: boolean; model?: string; cwd?: string; account?: string }
 ): UsageRequestView[] {
   const spec = rangeSpec(query.range ?? DEFAULT_RANGE)
   const records = store.query({
@@ -247,7 +247,8 @@ export function buildRequests(
     errorsOnly: query.errorsOnly === true,
     limit: clampLimit(query.limit),
     model: query.model,
-    cwd: query.cwd
+    cwd: query.cwd,
+    account: query.account
   })
   return records.map(record => ({
     ...record,
@@ -290,7 +291,8 @@ export function registerUsageRoutes(options: UsageRoutesOptions): void {
         limit: Number(url.searchParams.get('limit') ?? '') || undefined,
         errorsOnly: url.searchParams.get('errors') === '1',
         model: url.searchParams.get('model') ?? undefined,
-        cwd: url.searchParams.get('cwd') ?? undefined
+        cwd: url.searchParams.get('cwd') ?? undefined,
+        account: url.searchParams.get('account') ?? undefined
       })
     })
   })

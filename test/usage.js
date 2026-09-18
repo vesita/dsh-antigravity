@@ -348,6 +348,29 @@ check('旧库（无 account 列）打开时自动补列，历史行全部保留'
   upgraded.close()
 })
 
+check('已记录更高 schema 版本的库不会被旧代码降级标记', () => {
+  const futurePath = join(storeDir, 'future.db')
+  const future = new DatabaseSync(futurePath)
+  future.exec('CREATE TABLE usage_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+  future.exec("INSERT INTO usage_meta (key, value) VALUES ('schema', '3')")
+  future.close()
+  const opened = new UsageStore(futurePath)
+  assert.strictEqual(opened.meta('schema'), '3', '版本只能前进，不能被旧代码写回旧值')
+  opened.close()
+})
+
+check('明细可以按账号过滤，空串筛的是「没有主」的历史行', () => {
+  const probe = new UsageStore(':memory:')
+  probe.insert('k-f1', record({ time: 10, account: 'a@b.c' }))
+  probe.insert('k-f2', record({ time: 11, account: 'd@e.f' }))
+  probe.insert('k-f3', record({ time: 12 }))
+  assert.strictEqual(probe.query({ account: 'a@b.c' }).length, 1)
+  assert.strictEqual(probe.query({ account: '' }).length, 1, '空串是有意义的筛选值，不是「不过滤」')
+  assert.strictEqual(probe.query({}).length, 3)
+  assert.strictEqual(buildRequests(probe, DEFAULT_PRICING, { range: 'all', account: 'd@e.f' }).length, 1)
+  probe.close()
+})
+
 check('快照按账号分组，未记录账号的历史归入 (unknown)', () => {
   const probe = new UsageStore(':memory:')
   probe.insert('k-a1', record({ time: 1_000_000, account: 'a@b.c' }))

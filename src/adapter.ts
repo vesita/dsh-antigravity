@@ -304,7 +304,16 @@ export class GoogleAntigravityAdapter extends LlmAdapter {
       // just means the wrong account was picked, so the pool is asked for the
       // next one instead of surfacing a failure the user cannot act on.
       for (;;) {
-        const creds = await this.#credentials(options.signal, tried)
+        let creds: AntigravityCredentials | undefined
+        try {
+          creds = await this.#credentials(options.signal, tried)
+        } catch (error) {
+          // An account already failed for a reason the user can act on (quota,
+          // a rejected grant). Whatever went wrong while looking for the *next*
+          // account must not replace that: the first failure is the diagnosis.
+          if (lastError !== null) throw lastError
+          throw error
+        }
         if (creds === undefined) {
           if (lastError !== null) throw lastError
           throw new LlmError(MISSING_CREDENTIAL_MESSAGE, 'MISSING_CREDENTIAL')
@@ -409,7 +418,17 @@ export class GoogleAntigravityAdapter extends LlmAdapter {
     } catch (error) {
       if (error instanceof LlmError) throw error
       if (signal?.aborted) throw new LlmError('Antigravity 请求已被取消', 'ABORTED', { cause: error })
-      throw new LlmError(MISSING_CREDENTIAL_MESSAGE, 'MISSING_CREDENTIAL', { cause: error })
+      // A credential layer that failed for a reason of its own — every refresh
+      // token rejected, the account registry unreadable — knows more about it
+      // than this adapter does, so its message is what the caller reads. Only a
+      // layer that explicitly offered nothing gets "not signed in", which would
+      // otherwise send the user to re-login over a token that only needed
+      // refreshing.
+      throw new LlmError(
+        error instanceof Error && error.message !== '' ? error.message : MISSING_CREDENTIAL_MESSAGE,
+        'MISSING_CREDENTIAL',
+        { cause: error }
+      )
     }
   }
 
@@ -515,7 +534,10 @@ export function parseQuotaResetMs(body: string, now: number = Date.now()): numbe
   const match = /Resets in\s+(?:([0-9]+)h)?(?:([0-9]+)m)?(?:([0-9]+(?:\.[0-9]+)?)s)?/i.exec(String(body || ''))
   if (match === null) return undefined
   const ms = Math.round((Number(match[1] || 0) * 3600 + Number(match[2] || 0) * 60 + Number(match[3] || 0)) * 1000)
-  return ms > 0 ? now + ms : undefined
+  // `Resets in 0s` is a real answer meaning "the quota is back": it must be kept
+  // as a zero-length wait, because dropping it here would let the pool fall back
+  // to its conservative default and park a healthy account for ten minutes.
+  return ms >= 0 ? now + ms : undefined
 }
 
 function httpCode(status: number): string {
@@ -554,8 +576,11 @@ function quotaMessage(base: string, status: number, body: string): string {
   const head = `Antigravity 端点 ${base} 返回 ${status}`
   const isQuota = /QUOTA_EXHAUSTED|Individual quota reached|Resource has been exhausted/i.test(raw)
   if (!isQuota) return `${head}: ${raw.slice(0, 500)}`
-  const reset = /Resets in ([0-9]+h)?([0-9]+m)?([0-9]+(?:\.[0-9]+)?s)/i.exec(raw)
-  const when = reset === null ? '' : `，约 ${reset[0].replace(/^Resets in /i, '')} 后重置`
+  // Same shape as {@link parseQuotaResetMs}: hours, minutes and seconds are each
+  // optional, because Google writes `45m` as readily as `1h31m29s`, and a regex
+  // that demands seconds silently drops the human-readable half of the message.
+  const reset = /Resets in\s+(?:([0-9]+)h)?(?:([0-9]+)m)?(?:([0-9]+(?:\.[0-9]+)?)s)?/i.exec(raw)
+  const when = reset === null ? '' : `，约 ${reset[0].replace(/^Resets in\s+/i, '')} 后重置`
   return `${head}：配额已用尽${when}。这不是退避重试能解决的（不会自动重试）；请等重置、或升级订阅。原始响应：${raw.slice(0, 300)}`
 }
 

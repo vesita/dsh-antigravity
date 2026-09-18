@@ -247,8 +247,17 @@
           setBusy(true)
           setError(null)
           try {
-            await fn()
-            await refresh()
+            const result = await fn()
+            // `/logout`, `/accounts/active` and `/accounts/remove` answer with the
+            // whole status payload. Adopting it is both one request cheaper and
+            // the reason a successful mutation cannot be lost to a follow-up GET
+            // that happened to fail.
+            if (result !== null && typeof result === 'object' && 'authenticated' in result) {
+              setStatus(result)
+              setAuthUrl(result.loginUrl || null)
+            } else {
+              await refresh()
+            }
           } catch (cause) {
             setError(cause.message)
           } finally {
@@ -293,18 +302,35 @@
       const notice =
         status != null && !authenticated && !pending && !expired && status.error ? String(status.error) : null
 
-      // The heading counts accounts rather than naming one: with several
-      // installed, no single identity describes the provider any more, and each
-      // row below carries its own.
+      // The heading is decided by the *provider's* state first and the account
+      // list second: a red dot over "已登录" (every account expired) or a green
+      // dot over "未登录" (authenticated without a registry row) is exactly the
+      // contradiction this line used to produce.
       const heading = pending
         ? copy.waiting
-        : accounts.length > 0
-          ? accounts.length === 1
-            ? copy.signedIn
-            : `${copy.signedIn} · ${accounts.length} ${copy.accountsUnit}`
-          : expired
-            ? copy.expired
+        : !authenticated && expired
+          ? copy.expired
+          : authenticated
+            ? accounts.length > 1
+              ? `${copy.signedIn} · ${accounts.length} ${copy.accountsUnit}`
+              : copy.signedIn
             : copy.signedOut
+
+      // An authenticated status with no rows is the environment grant
+      // (`GOOGLE_ANTIGRAVITY_TOKEN`): it serves calls without ever being written
+      // to the registry, and the card must still say which account that is.
+      const envRow: AccountRow | null =
+        authenticated && accounts.length === 0
+          ? {
+              id: 'env',
+              label: status!.email || copy.account,
+              email: status!.email ?? null,
+              projectId: status!.projectId ?? null,
+              timeLeftSeconds: status!.timeLeftSeconds ?? null,
+              active: true
+            }
+          : null
+      const rows: AccountRow[] = envRow === null ? accounts : [envRow]
 
       const head = h(
         'div',
@@ -461,7 +487,7 @@
         'div',
         { style: styles.wrap, 'data-dsh-antigravity': 'card' },
         head,
-        accounts.length > 0 ? h('div', null, accounts.map(accountRow)) : null,
+        rows.length > 0 ? h('div', null, rows.map(accountRow)) : null,
         actions,
         notice ? h('p', { key: 'notice', style: styles.hint }, notice) : null,
         error ? h('p', { key: 'error', style: styles.error }, `${copy.failed}: ${error}`) : null

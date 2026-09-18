@@ -387,18 +387,36 @@ export function apply(ctx: any, config: AntigravitySettings = {}): void {
   }
 
   /**
-   * Keep the marker and the grant in step. The marker *is* how the account is
-   * installed, so its removal — this plugin's 退出登录, the row's native
-   * 「移除」, or a hand edit of `settings.yaml` — removes every account too.
+   * Keep the marker and the credentials in step. The marker *is* how the
+   * account is installed, so its removal — the row's native 「移除」, or a hand
+   * edit of `settings.yaml` — removes every account too.
    *
    * Only the set → unset transition counts: a grant installed by the standalone
    * CLI never had a marker, and an unrelated settings edit must not delete it.
+   *
+   * Carried out after a short grace period, because this is the one irreversible
+   * path in the plugin — what it deletes are refresh tokens that exist nowhere
+   * else. A settings reload that lands while the file is being written also
+   * reads as "the marker is gone", and that flicker must not cost the user every
+   * account. The presence of any marker again cancels the wipe, and
+   * `AccountPool.clear` keeps one generation of backup besides.
    */
+  const removalGraceMs = 1000
+  let removalTimer: ReturnType<typeof setTimeout> | null = null
   const reconcileAccount = (): void => {
     const account = current().account
     const removed = previousAccount !== undefined && account === undefined
     previousAccount = account
-    if (removed) void pool.clear()
+    if (removalTimer !== null) {
+      clearTimeout(removalTimer)
+      removalTimer = null
+    }
+    if (!removed) return
+    removalTimer = setTimeout(() => {
+      removalTimer = null
+      void pool.clear()
+    }, removalGraceMs)
+    removalTimer.unref?.()
   }
 
   // -------------------------------------------------------------------------
@@ -620,53 +638,38 @@ export function apply(ctx: any, config: AntigravitySettings = {}): void {
       }
     }
 
-    webCtx.effect(
-      () =>
-        webCtx.webServer.register({
-          kind: 'exact',
-          path: `${ROUTE_PREFIX}/status`,
-          handler: async (req: IncomingMessage, res: ServerResponse) => {
-            if (guard(req, res)) return
-            if (req.method !== 'GET') return methodNotAllowed(res, 'GET')
-            sendJson(res, 200, await status())
-          }
-        }),
-      `dsh-antigravity: GET ${ROUTE_PREFIX}/status`
-    )
-
-    webCtx.effect(
-      () =>
-        webCtx.webServer.register({
-          kind: 'exact',
-          path: `${ROUTE_PREFIX}/login`,
-          handler: async (req: IncomingMessage, res: ServerResponse) => {
-            if (guard(req, res)) return
-            if (req.method !== 'POST') return methodNotAllowed(res, 'POST')
-            try {
-              const url = await login.begin()
-              sendJson(res, 200, { url, pending: true })
-            } catch (error) {
-              sendJson(res, 500, { error: error.message })
+    /**
+     * Register one auth route with the guard, the method check and a failure
+     * answer already in place.
+     *
+     * Every body here can reject — a registry write can fail, a token refresh
+     * can throw — and a rejection that escapes the handler leaves the browser
+     * waiting for a response that never comes, with nothing in the page to say
+     * why. One shape for all of them means the answer is always a status code.
+     */
+    const route = (
+      method: 'GET' | 'POST',
+      path: string,
+      handler: (req: IncomingMessage, res: ServerResponse) => Promise<void> | void
+    ): void => {
+      webCtx.effect(
+        () =>
+          webCtx.webServer.register({
+            kind: 'exact',
+            path,
+            handler: async (req: IncomingMessage, res: ServerResponse) => {
+              if (guard(req, res)) return
+              if (req.method !== method) return methodNotAllowed(res, method)
+              try {
+                await handler(req, res)
+              } catch (error: any) {
+                if (!res.headersSent) sendJson(res, 500, { error: error?.message ?? String(error) })
+              }
             }
-          }
-        }),
-      `dsh-antigravity: POST ${ROUTE_PREFIX}/login`
-    )
-
-    webCtx.effect(
-      () =>
-        webCtx.webServer.register({
-          kind: 'exact',
-          path: `${ROUTE_PREFIX}/cancel`,
-          handler: (req: IncomingMessage, res: ServerResponse) => {
-            if (guard(req, res)) return
-            if (req.method !== 'POST') return methodNotAllowed(res, 'POST')
-            login.cancel()
-            sendJson(res, 200, { pending: false })
-          }
-        }),
-      `dsh-antigravity: POST ${ROUTE_PREFIX}/cancel`
-    )
+          }),
+        `dsh-antigravity: ${method} ${path}`
+      )
+    }
 
     /**
      * Keep the settings marker in step with the account list after a change.
@@ -680,82 +683,60 @@ export function apply(ctx: any, config: AntigravitySettings = {}): void {
       else await markAccountInstalled()
     }
 
-    webCtx.effect(
-      () =>
-        webCtx.webServer.register({
-          kind: 'exact',
-          path: `${ROUTE_PREFIX}/logout`,
-          handler: async (req: IncomingMessage, res: ServerResponse) => {
-            if (guard(req, res)) return
-            if (req.method !== 'POST') return methodNotAllowed(res, 'POST')
-            login.cancel()
-            // Signs the *active* account out and leaves the rest installed:
-            // with several accounts, 「退出登录」 on one row must not silently
-            // discard the others.
-            await pool.signOut()
-            await afterAccountChange()
-            sendJson(res, 200, await status())
-          }
-        }),
-      `dsh-antigravity: POST ${ROUTE_PREFIX}/logout`
-    )
+    route('GET', `${ROUTE_PREFIX}/status`, async (req, res) => {
+      sendJson(res, 200, await status())
+    })
 
-    webCtx.effect(
-      () =>
-        webCtx.webServer.register({
-          kind: 'exact',
-          path: `${ROUTE_PREFIX}/accounts`,
-          handler: async (req: IncomingMessage, res: ServerResponse) => {
-            if (guard(req, res)) return
-            if (req.method !== 'GET') return methodNotAllowed(res, 'GET')
-            await pool.ready()
-            sendJson(res, 200, poolSnapshot())
-          }
-        }),
-      `dsh-antigravity: GET ${ROUTE_PREFIX}/accounts`
-    )
+    route('POST', `${ROUTE_PREFIX}/login`, async (req, res) => {
+      const url = await login.begin()
+      sendJson(res, 200, { url, pending: true })
+    })
 
-    webCtx.effect(
-      () =>
-        webCtx.webServer.register({
-          kind: 'exact',
-          path: `${ROUTE_PREFIX}/accounts/active`,
-          handler: async (req: IncomingMessage, res: ServerResponse) => {
-            if (guard(req, res)) return
-            if (req.method !== 'POST') return methodNotAllowed(res, 'POST')
-            const body = await readJsonBody(req)
-            const id = typeof body?.id === 'string' ? body.id : ''
-            if (id === '' || !(await pool.setActive(id))) {
-              sendJson(res, 404, { error: '未找到该账号' })
-              return
-            }
-            await markAccountInstalled()
-            sendJson(res, 200, await status())
-          }
-        }),
-      `dsh-antigravity: POST ${ROUTE_PREFIX}/accounts/active`
-    )
+    route('POST', `${ROUTE_PREFIX}/cancel`, (req, res) => {
+      login.cancel()
+      sendJson(res, 200, { pending: false })
+    })
 
-    webCtx.effect(
-      () =>
-        webCtx.webServer.register({
-          kind: 'exact',
-          path: `${ROUTE_PREFIX}/accounts/remove`,
-          handler: async (req: IncomingMessage, res: ServerResponse) => {
-            if (guard(req, res)) return
-            if (req.method !== 'POST') return methodNotAllowed(res, 'POST')
-            const body = await readJsonBody(req)
-            const id = typeof body?.id === 'string' ? body.id : ''
-            if (id === '' || !(await pool.remove(id))) {
-              sendJson(res, 404, { error: '未找到该账号' })
-              return
-            }
-            await afterAccountChange()
-            sendJson(res, 200, await status())
-          }
-        }),
-      `dsh-antigravity: POST ${ROUTE_PREFIX}/accounts/remove`
-    )
+    route('POST', `${ROUTE_PREFIX}/logout`, async (req, res) => {
+      login.cancel()
+      // Signs the *active* account out and leaves the rest installed: with
+      // several accounts, 「退出登录」 on one row must not silently discard the
+      // others.
+      await pool.signOut()
+      await afterAccountChange()
+      sendJson(res, 200, await status())
+    })
+
+    route('GET', `${ROUTE_PREFIX}/accounts`, async (req, res) => {
+      await pool.ready()
+      sendJson(res, 200, poolSnapshot())
+    })
+
+    /** Read the `id` a mutation names, or answer 404 when it is not there. */
+    const accountId = async (req: IncomingMessage): Promise<string> => {
+      const body = await readJsonBody(req)
+      return typeof body?.id === 'string' ? body.id : ''
+    }
+
+    route('POST', `${ROUTE_PREFIX}/accounts/active`, async (req, res) => {
+      const id = await accountId(req)
+      if (id === '' || !(await pool.setActive(id))) {
+        sendJson(res, 404, { error: '未找到该账号' })
+        return
+      }
+      await markAccountInstalled()
+      sendJson(res, 200, await status())
+    })
+
+    route('POST', `${ROUTE_PREFIX}/accounts/remove`, async (req, res) => {
+      const id = await accountId(req)
+      if (id === '' || !(await pool.remove(id))) {
+        sendJson(res, 404, { error: '未找到该账号' })
+        return
+      }
+      await afterAccountChange()
+      sendJson(res, 200, await status())
+    })
 
     // -----------------------------------------------------------------------
     // Usage panel API — same loopback guard as the auth routes, so the
@@ -825,6 +806,10 @@ export function apply(ctx: any, config: AntigravitySettings = {}): void {
   })
 
   ctx.effect(() => () => {
+    if (removalTimer !== null) {
+      clearTimeout(removalTimer)
+      removalTimer = null
+    }
     try {
       adapterHandle?.()
     } catch {

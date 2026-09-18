@@ -3,6 +3,7 @@ import path from 'node:path'
 import { createHash } from 'node:crypto'
 import {
   accountLabelOf,
+  discoverEmail,
   dshHome,
   isExpiring,
   loadEnvCredentials,
@@ -45,6 +46,13 @@ export const DEFAULT_QUOTA_COOLDOWN_MS = 10 * 60 * 1000
 
 /** Ceiling on any cooldown, so one bad parse cannot park an account forever. */
 export const MAX_QUOTA_COOLDOWN_MS = 24 * 60 * 60 * 1000
+
+/**
+ * How long an account is skipped after a credential failure (a refresh that came
+ * back rejected or unreachable). Long enough that a dead grant is not re-tried on
+ * every call, short enough that a transient failure costs one window.
+ */
+export const AUTH_COOLDOWN_MS = 5 * 60 * 1000
 
 /** Synthetic account id for the `GOOGLE_ANTIGRAVITY_TOKEN` environment grant. */
 export const ENV_ACCOUNT_ID = 'env'
@@ -139,6 +147,8 @@ export interface AccountPoolOptions {
   warn?: (message: string) => void
   /** Token refresh, injectable for tests. */
   refresh?: (creds: AntigravityCredentials, options: OAuthClientOverrides & { signal?: AbortSignal }) => Promise<AntigravityCredentials>
+  /** Identity lookup for a grant that has no email; injectable for tests. */
+  discoverEmail?: (access: string, signal?: AbortSignal) => Promise<string | undefined>
 }
 
 // ---------------------------------------------------------------------------
@@ -193,10 +203,20 @@ export function readAccountRegistry(file: string = accountsFilePath()): AccountR
   }
 }
 
-/** Write the registry with owner-only permissions. */
+/**
+ * Write the registry with owner-only permissions.
+ *
+ * Written to a sibling temp file and renamed into place. `writeFileSync` alone
+ * truncates the target first, and a reader that lands in that window — the CLI,
+ * a second DSH process, a status request — would parse an empty file and
+ * conclude the user has no accounts at all. `rename` within one filesystem is
+ * atomic, so a reader sees either the old registry or the new one.
+ */
 export function writeAccountRegistry(registry: AccountRegistry, file: string = accountsFilePath()): void {
   fs.mkdirSync(path.dirname(file), { recursive: true })
-  fs.writeFileSync(file, JSON.stringify(registry, null, 2), { mode: 0o600 })
+  const temporary = `${file}.${process.pid}.tmp`
+  fs.writeFileSync(temporary, JSON.stringify(registry, null, 2), { mode: 0o600 })
+  fs.renameSync(temporary, file)
   try {
     fs.chmodSync(file, 0o600)
   } catch {
@@ -273,6 +293,60 @@ export function upsertAccount(
 export function activeAccount(registry: AccountRegistry): AccountEntry | null {
   if (registry.accounts.length === 0) return null
   return registry.accounts.find(a => a.id === registry.activeId) ?? registry.accounts[0]
+}
+
+/**
+ * Fold entries that turn out to be the same Google account into one.
+ *
+ * Duplicates come from an email-less grant: an account adopted from a
+ * single-account install is identified by its project id, so a sign-in with that
+ * same Google account lands beside it instead of refreshing it. Two entries for
+ * one account are worse than untidy — the pool would rotate a single quota
+ * between them and report a failover that cannot help.
+ *
+ * The survivor is the entry that appears first (the oldest, which is the one the
+ * card has been showing); it takes the newer grant, the later cooldown, the
+ * active flag and the earliest `addedAt`.
+ *
+ * @param registry - registry to mutate.
+ * @param now - clock, epoch ms.
+ * @returns how many entries were folded away.
+ */
+export function mergeDuplicates(registry: AccountRegistry, now: number = Date.now()): number {
+  const kept: AccountEntry[] = []
+  const byEmail = new Map<string, AccountEntry>()
+  let merged = 0
+  for (const entry of registry.accounts) {
+    const email = (entry.email ?? entry.creds.email ?? '').trim().toLowerCase()
+    if (email === '') {
+      kept.push(entry)
+      continue
+    }
+    const survivor = byEmail.get(email)
+    if (survivor === undefined) {
+      byEmail.set(email, entry)
+      kept.push(entry)
+      continue
+    }
+    merged += 1
+    if (registry.activeId === entry.id) registry.activeId = survivor.id
+    if ((entry.creds.expires ?? 0) > (survivor.creds.expires ?? 0)) {
+      survivor.creds = { ...entry.creds, accountId: survivor.id }
+    }
+    survivor.projectId = survivor.projectId ?? entry.projectId
+    survivor.addedAt = Math.min(survivor.addedAt, entry.addedAt)
+    survivor.lastUsedAt = Math.max(survivor.lastUsedAt ?? 0, entry.lastUsedAt ?? 0) || undefined
+    survivor.cooldownUntil = Math.max(survivor.cooldownUntil ?? 0, entry.cooldownUntil ?? 0) || undefined
+    if (survivor.lastError === undefined) {
+      survivor.lastError = entry.lastError
+      survivor.lastErrorKind = entry.lastErrorKind
+    }
+  }
+  if (merged > 0) {
+    registry.accounts = kept
+    registry.updatedAt = now
+  }
+  return merged
 }
 
 /** Remove one account, re-pointing `activeId` when the active one left. */
@@ -473,8 +547,7 @@ export class AccountPool {
   }
 
   async #adopt(): Promise<void> {
-    const registry = this.#load()
-    if (registry.accounts.length > 0) return
+    if (this.#load().accounts.length > 0) return
     let legacy: AntigravityCredentials | null = null
     try {
       legacy = await readCredentialRecord(this.#options.credentials?.())
@@ -482,10 +555,23 @@ export class AccountPool {
       legacy = null
     }
     if (legacy === null || !legacy.access) legacy = readAuthFile()
-    const entry = adoptLegacy(registry, legacy, this.#now())
+    if (legacy === null || !legacy.access) return
+
+    // The lookups above are I/O, and the CLI writes this same registry: an
+    // account may have been registered while we waited. Re-reading is what keeps
+    // this adoption from erasing it — the registry parsed a moment ago would be
+    // written back whole, minus the new account.
+    const registry = this.#load()
+    const grew = registry.accounts.length > 0
+    const entry = grew ? upsertAccount(registry, legacy, this.#now()) : adoptLegacy(registry, legacy, this.#now())
     if (entry === null) return
+    mergeDuplicates(registry, this.#now())
     this.#persist(registry)
-    this.#options.warn?.(`dsh-antigravity: 已把现有凭据登记为首个账号（${entry.label}）`)
+    this.#options.warn?.(
+      grew
+        ? `dsh-antigravity: 已把旧版凭据登记为附加账号（${entry.label}）`
+        : `dsh-antigravity: 已把现有凭据登记为首个账号（${entry.label}）`
+    )
   }
 
   /** Accounts as the settings card reads them. */
@@ -538,7 +624,7 @@ export class AccountPool {
         transient: true
       })
     }
-    for (const entry of this.#order(registry)) {
+    for (const entry of registry.accounts) {
       candidates.push({ id: entry.id, creds: entry.creds, transient: false })
     }
 
@@ -550,20 +636,30 @@ export class AccountPool {
     // own quota message reaches the caller instead of "no credentials".
     const order =
       ready.length > 0
-        ? ready
+        ? this.#order(ready)
         : available.slice().sort((a, b) => this.#cooldownEnd(a, now) - this.#cooldownEnd(b, now))
 
+    let lastFailure: unknown = null
     for (const candidate of order) {
       try {
         const creds = await this.#usable(candidate)
         if (creds !== undefined) {
-          this.markUsed(creds)
+          // Handing an account out is not evidence its quota recovered, so a
+          // candidate that was parked a moment ago keeps its park — see
+          // {@link AccountPool.markUsed}.
+          this.markUsed(creds, { recovered: !this.#cooling(candidate, now) })
           return creds
         }
       } catch (error: any) {
+        lastFailure = error
         this.#noteFailure(candidate.id, 'auth', messageOf(error))
       }
     }
+    // Accounts exist but not one of them produced credentials. Returning
+    // `undefined` here would flatten that into "not signed in" and send the user
+    // to re-login over a token that only needed refreshing, so the last real
+    // reason travels up instead.
+    if (lastFailure !== null) throw lastFailure
     return undefined
   }
 
@@ -607,18 +703,36 @@ export class AccountPool {
     return this.#refresh({ id: entry.id, creds: entry.creds, transient: false })
   }
 
-  /** Order accounts for this call; round-robin advances a cursor per call. */
-  #order(registry: AccountRegistry): AccountEntry[] {
-    const accounts = registry.accounts.slice()
-    if (accounts.length <= 1) return accounts
-    const activeIndex = accounts.findIndex(a => a.id === registry.activeId)
+  /**
+   * Order the accounts that can actually serve this call.
+   *
+   * The rotation deliberately runs on the *ready* set rather than the whole
+   * registry. Advancing the cursor over accounts that are parked or already
+   * tried hands the remaining ones a skewed share — measured with three accounts
+   * and one parked: the first healthy account took two thirds of the calls
+   * instead of half, which is exactly the load that spends its quota next.
+   *
+   * Environment grants stay in front of every rotation: an operator who set
+   * `GOOGLE_ANTIGRAVITY_TOKEN` asked for that credential specifically.
+   *
+   * @param ready - candidates that are neither excluded nor parked.
+   * @returns the same candidates in the order they should be tried.
+   */
+  #order(ready: Candidate[]): Candidate[] {
+    const fromEnv = ready.filter(candidate => candidate.transient)
+    const rest = ready.filter(candidate => !candidate.transient)
+    if (rest.length <= 1) return [...fromEnv, ...rest]
+
     if (this.strategy() === 'active-first') {
-      if (activeIndex > 0) accounts.unshift(accounts.splice(activeIndex, 1)[0])
-      return accounts
+      const activeId = this.#load().activeId
+      const index = rest.findIndex(candidate => candidate.id === activeId)
+      const ordered = index > 0 ? [rest[index], ...rest.slice(0, index), ...rest.slice(index + 1)] : rest
+      return [...fromEnv, ...ordered]
     }
-    const start = this.#cursor % accounts.length
+
+    const start = this.#cursor % rest.length
     this.#cursor = (this.#cursor + 1) % 1_000_000
-    return accounts.slice(start).concat(accounts.slice(0, start))
+    return [...fromEnv, ...rest.slice(start), ...rest.slice(0, start)]
   }
 
   #cooling(candidate: Candidate, now: number): boolean {
@@ -654,18 +768,60 @@ export class AccountPool {
   async #refresh(candidate: Candidate): Promise<AntigravityCredentials> {
     const refresh = this.#options.refresh ?? refreshAccessToken
     const refreshed = await refresh(candidate.creds, { ...this.#options.oauth?.() })
-    // `refreshAccessToken` mutates in place, so the registry entry already holds
-    // the new token; persisting it is what survives a restart.
+
+    // The registry is re-read *after* the round trip rather than trusted from
+    // before it: another writer (a concurrent call, the CLI) may have rewritten
+    // the file meanwhile, and writing the fresh token into whatever is on disk
+    // *now* is what keeps the refresh from being silently dropped.
     const registry = this.#load()
-    if (registry.accounts.some(entry => entry.id === candidate.id)) this.#persist(registry)
+    const entry = registry.accounts.find(a => a.id === candidate.id)
+    if (entry === undefined) return refreshed
+    entry.creds = { ...refreshed, accountId: entry.id }
+    this.#persist(registry)
+
+    // A grant adopted from a single-account install carries no email, so it can
+    // only ever be named by its project — and a sign-in with that same Google
+    // account becomes a second entry instead of refreshing the first. The
+    // refresh has just produced a live access token: the cheapest moment to ask
+    // who it belongs to, and to fold away any duplicate that wait produced.
+    if ((entry.email ?? entry.creds.email ?? '') === '') {
+      const learned = await this.#discoverEmail(refreshed.access)
+      if (learned !== undefined) {
+        entry.email = learned
+        entry.label = learned
+        refreshed.email = learned
+        mergeDuplicates(registry, this.#now())
+        this.#persist(registry)
+        const survivor = registry.accounts.find(
+          a => (a.email ?? a.creds.email ?? '').trim().toLowerCase() === learned.toLowerCase()
+        )
+        if (survivor !== undefined && survivor.id !== entry.id) refreshed.accountId = survivor.id
+      }
+    }
     return refreshed
   }
 
+  /** Best-effort identity lookup; an unreachable Google never breaks a call. */
+  async #discoverEmail(access: string): Promise<string | undefined> {
+    try {
+      const learned = await (this.#options.discoverEmail ?? discoverEmail)(access)
+      return typeof learned === 'string' && learned.trim() !== '' ? learned.trim() : undefined
+    } catch {
+      return undefined
+    }
+  }
+
   /**
-   * Record that an account just served a call. Clears any park and failure:
-   * a call that worked is the proof that the quota came back.
+   * Record that an account was handed out for a call.
+   *
+   * @param creds - the credentials `resolve` returned.
+   * @param options - `{ recovered }` is false when the account came out of the
+   *   soonest-recovering fallback, i.e. it was parked a moment ago. A park is
+   *   only lifted by evidence, and being handed out is not evidence: clearing it
+   *   here would make an all-exhausted pool retry every account on every call
+   *   instead of waiting for the reset it was told about.
    */
-  markUsed(creds: AntigravityCredentials | undefined): void {
+  markUsed(creds: AntigravityCredentials | undefined, options: { recovered?: boolean } = {}): void {
     if (creds === undefined || creds === null) return
     const id = typeof creds.accountId === 'string' && creds.accountId !== '' ? creds.accountId : accountIdFor(creds)
     if (id === ENV_ACCOUNT_ID) return
@@ -673,18 +829,18 @@ export class AccountPool {
     const entry = registry.accounts.find(a => a.id === id)
     if (entry === undefined) return
     const now = this.#now()
-    const dirty =
-      entry.cooldownUntil !== undefined ||
-      entry.lastError !== undefined ||
-      entry.lastUsedAt === undefined ||
-      now - entry.lastUsedAt > 60_000
+    const recovered = options.recovered !== false
+    const stale = entry.lastUsedAt === undefined || now - entry.lastUsedAt > 60_000
+    const cleared = recovered && (entry.cooldownUntil !== undefined || entry.lastError !== undefined)
     entry.lastUsedAt = now
-    entry.cooldownUntil = undefined
-    entry.lastError = undefined
-    entry.lastErrorKind = undefined
+    if (recovered) {
+      entry.cooldownUntil = undefined
+      entry.lastError = undefined
+      entry.lastErrorKind = undefined
+    }
     // Once a minute is enough resolution for "last used" and keeps a hot model
     // route from writing the registry on every single call.
-    if (dirty) this.#persist(registry)
+    if (stale || cleared) this.#persist(registry)
   }
 
   /**
@@ -701,11 +857,15 @@ export class AccountPool {
     entry.lastError = info.message
     entry.lastErrorKind = info.kind
     if (info.kind === 'quota') {
+      // A provider that names a reset time already in the past ("Resets in 0s")
+      // is saying the quota is back; parking it anyway would take a healthy
+      // account out of the rotation for the conservative default. Silence about
+      // the reset time is the case that default exists for.
       const until =
-        typeof info.cooldownUntil === 'number' && info.cooldownUntil > now
+        typeof info.cooldownUntil === 'number'
           ? info.cooldownUntil
           : now + (this.#options.quotaCooldownMs ?? DEFAULT_QUOTA_COOLDOWN_MS)
-      entry.cooldownUntil = Math.min(until, now + MAX_QUOTA_COOLDOWN_MS)
+      entry.cooldownUntil = until > now ? Math.min(until, now + MAX_QUOTA_COOLDOWN_MS) : undefined
     }
     this.#persist(registry)
   }
@@ -717,6 +877,15 @@ export class AccountPool {
     if (entry === undefined) return
     entry.lastError = message
     entry.lastErrorKind = kind
+    // A grant whose refresh fails fails the same way on every attempt, and each
+    // attempt is three retries against Google's token endpoint before it gives
+    // up (`refreshAccessToken`), so leaving the account eligible means paying
+    // that on every single call. Parking it briefly bounds the storm without
+    // writing off an account over one transient network blip.
+    if (kind === 'auth') {
+      const now = this.#now()
+      entry.cooldownUntil = Math.max(entry.cooldownUntil ?? 0, now + AUTH_COOLDOWN_MS)
+    }
     this.#persist(registry)
   }
 
@@ -731,9 +900,17 @@ export class AccountPool {
     const registry = this.#load()
     const entry = upsertAccount(registry, creds, this.#now())
     if (options.makeActive !== false) registry.activeId = entry.id
+    // Two entries can share an email only if one of them learned it late (or a
+    // previous build wrote them); a sign-in is a good moment to fold them, and
+    // the merge re-points `activeId` at the survivor when it swallows this one.
+    const merged = mergeDuplicates(registry, this.#now())
     this.#persist(registry)
     await this.#persistSeam(registry)
-    return entry
+    if (merged === 0) return entry
+    const email = (creds.email ?? '').trim().toLowerCase()
+    return (
+      registry.accounts.find(a => (a.email ?? a.creds.email ?? '').trim().toLowerCase() === email) ?? entry
+    )
   }
 
   /** Remove one account by id. */
@@ -757,10 +934,27 @@ export class AccountPool {
     return true
   }
 
-  /** Forget every account (the provider row's 「移除」). */
+  /**
+   * Forget every account — the provider row's 「移除」.
+   *
+   * The only irreversible path in this module: what it deletes are refresh
+   * tokens, which cannot be recovered from anything else on the machine. It is
+   * reached from a settings transition (the marker going away), and a hand edit
+   * or a settings reload can produce that transition by accident, so one
+   * generation is kept beside the registry before the list is emptied.
+   */
   async clear(): Promise<void> {
     await this.ready()
     const registry = this.#load()
+    if (registry.accounts.length > 0) {
+      const file = this.#file()
+      try {
+        fs.copyFileSync(file, `${file}.bak`)
+        fs.chmodSync(`${file}.bak`, 0o600)
+      } catch (error: any) {
+        this.#options.warn?.(`dsh-antigravity: 清空前备份账号失败：${error.message}`)
+      }
+    }
     registry.accounts = []
     delete registry.activeId
     this.#persist(registry)

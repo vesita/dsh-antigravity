@@ -1,7 +1,7 @@
 import assert from 'node:assert'
 import { Context } from '@deepseek-ai/cordis'
 import { LlmRuntime } from '@deepseek-ai/dsh-llm'
-import { GoogleAntigravityAdapter, buildRequest, mapUsage, parseStream } from '../lib/adapter.js'
+import { GoogleAntigravityAdapter, buildRequest, mapUsage, parseQuotaResetMs, parseStream } from '../lib/adapter.js'
 import {
   CREDENTIAL_KEY,
   fromGrantRecord,
@@ -626,6 +626,47 @@ await check('card states an expired session once instead of echoing the host err
   assert.match(text, /登录已过期/)
   assert.doesNotMatch(text, /令牌已过期/)
 })
+await check('card does not claim a live session while every account is expired', () => {
+  // 红灯配「已登录」是这张卡最容易骗人的组合：列表非空不代表还能用。
+  const face = registration.factory(
+    requireFace(
+      fakeReact([
+        {
+          authenticated: false,
+          pending: false,
+          expired: true,
+          error: '刷新失败',
+          accounts: [{ id: 'a1', email: 'a@b.c', active: true, expired: true }]
+        }
+      ])
+    )
+  )
+  const text = textOf(face.AntigravityCard({ provider: { provider: 'google-antigravity' } })).join(' | ')
+  assert.match(text, /登录已过期/, '全部过期时必须说的是过期')
+  assert.doesNotMatch(text, /已登录/, '不得同时宣称已登录')
+})
+await check('card names the environment account when the registry is empty', () => {
+  // GOOGLE_ANTIGRAVITY_TOKEN 供的凭据不进注册表：此时 status 是 authenticated 但
+  // accounts 为空，卡片不能因此显示「未登录」。
+  const face = registration.factory(
+    requireFace(
+      fakeReact([
+        {
+          authenticated: true,
+          pending: false,
+          email: 'env@x.y',
+          projectId: 'proj',
+          timeLeftSeconds: 600,
+          accounts: []
+        }
+      ])
+    )
+  )
+  const text = textOf(face.AntigravityCard({ provider: { provider: 'google-antigravity' } })).join(' | ')
+  assert.match(text, /已登录/, '绿灯不能说未登录')
+  assert.match(text, /env@x\.y/, '必须指出这个凭据对应哪个账号')
+  assert.match(text, /proj/)
+})
 
 // ---------------------------------------------------------------------------
 // The closed loop: no account -> add -> sign in -> remove.
@@ -964,6 +1005,11 @@ function fakeSettings(initial = {}) {
       value = rest
       if (hooks) hooks.onChange()
     },
+    /** A settings reload that brings the marker back (see the flicker case). */
+    setAccountMarker(label) {
+      value = { ...value, account: label }
+      if (hooks) hooks.onChange()
+    },
     /** Any unrelated settings edit. */
     notify() {
       if (hooks) hooks.onChange()
@@ -1017,11 +1063,35 @@ await check('an unrelated settings edit keeps the grant', async () => {
   assert(markerSettings.calls.length === 1)
   assert(readAuthFile(), 'the grant must survive a settings change that leaves the marker alone')
 })
+// 标记这一节要直接看注册表：清空账号是否真的发生，只有文件能证明。
+const { accountsFilePath: markerRegistryPath, readAccountRegistry: readMarkerRegistry } = await import(
+  '../lib/accounts.js'
+)
+
 await check('the row\'s native 移除 takes the account with it', async () => {
   markerSettings.removeAccountMarker()
   await settle()
   assert.strictEqual(markerSettings.read().account, undefined)
+  // 清空账号是唯一不可逆的路径，所以它被推迟了一个宽限期才执行。
+  await new Promise(resolve => setTimeout(resolve, 1200))
   assert.strictEqual(readAuthFile(), null, 'removing the marker must remove the grant')
+  assert.strictEqual(readMarkerRegistry(markerRegistryPath()).accounts.length, 0, '清单也必须清空')
+})
+await check('标记短暂消失（设置重载）不得清空账号', async () => {
+  writeAuthFile({ access: 'seeded-access', projectId: 'aicode-consumers', expires: Date.now() + 3_600_000 })
+  await markerCall('GET', STATUS)
+  assert.strictEqual(readMarkerRegistry(markerRegistryPath()).accounts.length, 1, '先要有账号')
+  // 一次「看起来像移除」的闪烁：宽限期内标记又回来了。
+  markerSettings.removeAccountMarker()
+  await new Promise(resolve => setTimeout(resolve, 150))
+  markerSettings.setAccountMarker('aicode-consumers')
+  await new Promise(resolve => setTimeout(resolve, 1200))
+  assert.strictEqual(
+    readMarkerRegistry(markerRegistryPath()).accounts.length,
+    1,
+    '设置重载的闪烁不得删掉用户的账号'
+  )
+  assert(readAuthFile(), '镜像也必须还在')
 })
 await check('signing out clears the grant and the marker, so the row goes away', async () => {
   writeAuthFile({ access: 'seeded-access', projectId: 'aicode-consumers', expires: Date.now() + 3_600_000 })
@@ -1238,9 +1308,15 @@ await check('默认导出带上 name / inject / apply / Config', () => {
 // `~/.dsh/antigravity-auth.json` —— 跑在共享 home 里会把上面几节的状态搅乱。
 // ---------------------------------------------------------------------------
 console.log('# 13. 多账号注册表、选择策略与跨账号故障转移')
-const { AccountPool, upsertAccount, removeAccountById, adoptLegacy, accountsFilePath: poolPath } = await import(
-  '../lib/accounts.js'
-)
+const {
+  AccountPool,
+  upsertAccount,
+  removeAccountById,
+  adoptLegacy,
+  mergeDuplicates,
+  readAccountRegistry,
+  accountsFilePath: poolPath
+} = await import('../lib/accounts.js')
 
 const accountsHome = mkdtempSync(pathJoin(tmpdir(), 'dsh-antigravity-accounts-'))
 const sharedHome = process.env.DSH_HOME
@@ -1264,6 +1340,9 @@ const makePool = (options = {}) => {
     now: () => clock,
     warn: () => {},
     refresh: async creds => creds,
+    // Never let a unit test reach Google: identity lookup is stubbed off unless a
+    // case asks for one.
+    discoverEmail: async () => undefined,
     ...options
   })
 }
@@ -1376,6 +1455,193 @@ await check('全部账号都在冷却时仍交出最早恢复的那个（真实�
   pool.reportFailure({ accountId: d.id, kind: 'quota', message: 'q', cooldownUntil: clock + 600_000 })
   const creds = await pool.resolve()
   assert.strictEqual(creds.email, 'a@b.c')
+  // 兜底交出不等于配额恢复：冷却必须留着，否则每次调用都会把每个账号重试一遍。
+  assert.strictEqual(
+    pool.list().find(view => view.email === 'a@b.c').cooling,
+    true,
+    'a hand-out to a parked account must not lift the park'
+  )
+})
+
+await check('mergeDuplicates 折叠同一邮箱的条目并保住默认账号', () => {
+  const registry = {
+    version: 1,
+    activeId: 'dup',
+    accounts: [
+      // 先出现的那条是「晚学到邮箱」的旧条目：两个字段里任一有邮箱就算同号。
+      { id: 'old', label: 'proj', addedAt: 10, cooldownUntil: clock + 5000, creds: { access: 'a1', projectId: 'proj', expires: 100, email: 'x@y.z' } },
+      { id: 'dup', label: 'x@y.z', email: 'x@y.z', addedAt: 20, creds: { access: 'a2', email: 'x@y.z', projectId: 'proj', expires: 200 } }
+    ],
+    updatedAt: 0
+  }
+  assert.strictEqual(mergeDuplicates(registry, clock), 1)
+  assert.strictEqual(registry.accounts.length, 1)
+  assert.strictEqual(registry.accounts[0].id, 'old', '最先出现的那条留下')
+  assert.strictEqual(registry.accounts[0].creds.access, 'a2', '取过期更晚的那份凭据')
+  assert.strictEqual(registry.activeId, 'old', '默认账号必须指向幸存条目')
+  assert.strictEqual(registry.accounts[0].addedAt, 10, '最早加入时间保留')
+  assert.strictEqual(registry.accounts[0].cooldownUntil, clock + 5000, '冷却不能被合并抹掉')
+  assert.strictEqual(mergeDuplicates(registry, clock), 0, '没有重复时是空操作')
+})
+
+await check('重置时间已到时不得把账号停掉', async () => {
+  const pool = makePool()
+  const entry = await pool.add(credsOf('a@b.c'))
+  pool.reportFailure({ accountId: entry.id, kind: 'quota', message: 'q', cooldownUntil: clock - 1 })
+  assert.strictEqual(pool.list()[0].cooldownUntil, null, '已经到点的重置时间不是「停用 10 分钟」')
+  assert.strictEqual(pool.list()[0].cooling, false)
+  // 负控：provider 没说重置时间时才用保守默认。
+  pool.reportFailure({ accountId: entry.id, kind: 'quota', message: 'q' })
+  assert.strictEqual(pool.list()[0].cooling, true)
+})
+
+await check('全部账号都刷新失败时，报出的是真实原因而不是「未登录」', async () => {
+  const pool = makePool({
+    discoverEmail: async () => undefined,
+    refresh: async () => {
+      throw new Error('刷新 Google OAuth 令牌失败 (400): invalid_grant')
+    }
+  })
+  await pool.add({ access: 'x1', refresh: 'r1', email: 'a@x.y', expires: Date.now() - 1000 })
+  await pool.add({ access: 'x2', refresh: 'r2', email: 'b@x.y', expires: Date.now() - 1000 })
+  const result = await runAdapter(() => healthySse(), pool)
+  assert(result.error, '必须失败')
+  assert.match(result.error.message, /invalid_grant/, '真实原因必须传上来：' + result.error.message)
+  assert.doesNotMatch(
+    result.error.message,
+    /未找到 google-antigravity 认证凭据/,
+    '把刷新失败说成「没登录」会把人骗去重新登录'
+  )
+})
+
+await check('429 文案能读出声明的纯分钟重置时间', async () => {
+  const pool = makePool()
+  await pool.add(credsOf('a@b.c'))
+  const body = '{"error":{"message":"Individual quota reached. Resets in 45m."}}'
+  const result = await runAdapter(() => new Response(body, { status: 429 }), pool)
+  assert(result.error)
+  assert.match(result.error.message, /约 45m 后重置/, '文案：' + result.error.message.slice(0, 120))
+})
+
+await check('无 email 的旧条目在刷新后学到邮箱，并合并同一账号的重复条目', async () => {
+  const pool = makePool({
+    refresh: async creds => ({ ...creds, access: 'access-renewed', expires: Date.now() + 3_600_000 }),
+    discoverEmail: async () => 'real@x.y'
+  })
+  // 旧条目：无 email 且 access 已过期（所以 resolve 会走刷新）。
+  const legacy = await pool.add({ access: 'expired', refresh: 'r-legacy', projectId: 'proj', expires: Date.now() - 1000 })
+  // 用户用同一个 Google 账号又登录了一次 —— 旧版本下这就是第二条条目。
+  await pool.add({ access: 'a2', refresh: 'r2', email: 'real@x.y', projectId: 'proj', expires: Date.now() + 3_600_000 })
+  assert.strictEqual(pool.count(), 2, '先并存')
+
+  const creds = await pool.resolve()
+  assert.strictEqual(creds.email, 'real@x.y', '刷新后必须知道这是哪个账号')
+  assert.strictEqual(pool.count(), 1, '同一 Google 账号不得留下两条条目')
+  assert.strictEqual(pool.list()[0].id, legacy.id, '幸存的是最早那条，调用方也要跟着它')
+  assert.strictEqual(creds.accountId, legacy.id)
+  assert.strictEqual(pool.list()[0].label, 'real@x.y', '卡片上必须显示邮箱而不是项目名')
+})
+
+await check('刷新期间外部新增的账号不得被覆盖，且新 token 仍必须落盘', async () => {
+  const file = pathJoin(accountsHome, 'race-registry.json')
+  const pool = makePool({
+    file,
+    discoverEmail: async () => undefined,
+    refresh: async creds => {
+      // 刷新是一次网络往返，期间 CLI 完全可能往同一份注册表里加账号。
+      const concurrent = readAccountRegistry(file)
+      concurrent.accounts.push({
+        id: 'cli-added',
+        label: 'cli@x.y',
+        email: 'cli@x.y',
+        addedAt: 1,
+        creds: { access: 'cli-access', email: 'cli@x.y', projectId: 'proj', expires: Date.now() + 3_600_000 }
+      })
+      writeAccountRegistry(concurrent, file)
+      return { ...creds, access: 'access-renewed', expires: Date.now() + 3_600_000 }
+    }
+  })
+  await pool.add({ access: 'old', refresh: 'r', projectId: 'proj', expires: Date.now() - 1000 })
+  await pool.resolve()
+  const after = readAccountRegistry(file)
+  assert.strictEqual(after.accounts.length, 2, '并发加入的账号必须活着')
+  assert(
+    after.accounts.some(account => account.creds.access === 'access-renewed'),
+    '刷新结果必须落盘：' + JSON.stringify(after.accounts.map(account => account.creds.access))
+  )
+})
+
+await check('采纳期间外部新增的账号不得被覆盖', async () => {
+  const file = pathJoin(accountsHome, 'adopt-race.json')
+  let release = null
+  const seam = {
+    readRecord: () =>
+      new Promise(resolve => {
+        release = resolve
+      }),
+    modifyRecord: async () => {},
+    deleteRecord: async () => {}
+  }
+  const pool = makePool({ file, credentials: () => seam })
+  const adopting = pool.ready()
+  await new Promise(resolve => setTimeout(resolve, 10))
+  // 采纳正卡在 seam 读取上时，CLI 往同一份注册表里加了一个账号。
+  const cli = makePool({ file })
+  await cli.add(credsOf('cli@x.y'))
+  assert.strictEqual(readAccountRegistry(file).accounts.length, 1, 'CLI 账号已落盘')
+  release({ kind: 'grant', payload: { access: 'legacy', email: 'legacy@x.y', projectId: 'proj' } })
+  await adopting
+  const labels = readAccountRegistry(file).accounts.map(account => account.email).sort()
+  assert.deepStrictEqual(labels, ['cli@x.y', 'legacy@x.y'], '两条都必须活着：' + JSON.stringify(labels))
+})
+
+await check('刷新失败的账号会进入冷却，不会每次调用都重试', async () => {
+  let refreshes = 0
+  const pool = makePool({
+    discoverEmail: async () => undefined,
+    refresh: async () => {
+      refreshes += 1
+      throw new Error('invalid_grant')
+    }
+  })
+  const dead = await pool.add({ access: 'expired', refresh: 'dead', email: 'dead@x.y', expires: Date.now() - 1000 })
+  await pool.add(credsOf('live@x.y'))
+  const first = await pool.resolve()
+  assert.strictEqual(first.email, 'live@x.y', '故障转移必须落到另一个账号')
+  assert.strictEqual(refreshes, 1)
+  assert.strictEqual(pool.list().find(view => view.id === dead.id).cooling, true, '刷新失败的账号必须被停用')
+  await pool.resolve()
+  assert.strictEqual(refreshes, 1, '冷却期内不得再次重试那个死 refresh_token')
+})
+
+await check('一个账号冷却时，其余账号必须均分调用', async () => {
+  const pool = makePool()
+  const a = await pool.add(credsOf('a@x.y'))
+  await pool.add(credsOf('b@x.y'))
+  await pool.add(credsOf('c@x.y'))
+  pool.reportFailure({ accountId: a.id, kind: 'quota', message: 'q', cooldownUntil: clock + 60_000 })
+  const counts = {}
+  for (let index = 0; index < 20; index += 1) {
+    const creds = await pool.resolve()
+    counts[creds.email] = (counts[creds.email] || 0) + 1
+  }
+  assert.deepStrictEqual(counts, { 'b@x.y': 10, 'c@x.y': 10 }, '轮询要跑在可用集合上：' + JSON.stringify(counts))
+})
+
+await check('环境变量凭据永远优先，且不参与轮询', async () => {
+  const pool = makePool()
+  await pool.add(credsOf('a@x.y'))
+  await pool.add(credsOf('b@x.y'))
+  const previous = process.env.GOOGLE_ANTIGRAVITY_TOKEN
+  process.env.GOOGLE_ANTIGRAVITY_TOKEN = 'env-token'
+  try {
+    const seen = []
+    for (let index = 0; index < 4; index += 1) seen.push((await pool.resolve()).accountId)
+    assert.deepStrictEqual(seen, ['env', 'env', 'env', 'env'])
+  } finally {
+    if (previous === undefined) delete process.env.GOOGLE_ANTIGRAVITY_TOKEN
+    else process.env.GOOGLE_ANTIGRAVITY_TOKEN = previous
+  }
 })
 
 await check('故障转移用的 exclude 会跳过已试过的账号', async () => {
@@ -1466,6 +1732,21 @@ async function runAdapter(fetchImpl, pool) {
 
 const quotaBody = '{"error":{"message":"Individual quota reached. Resets in 1h0m0s."}}'
 
+await check('配额重置时间的解析覆盖常见写法', () => {
+  const now = 1_000_000
+  assert.strictEqual(parseQuotaResetMs('Resets in 1h31m29s.', now), now + (3600 + 31 * 60 + 29) * 1000)
+  assert.strictEqual(parseQuotaResetMs('Individual quota reached. Resets in 2m12s.', now), now + (2 * 60 + 12) * 1000)
+  assert.strictEqual(parseQuotaResetMs('Resets in 45m', now), now + 45 * 60 * 1000)
+  assert.strictEqual(parseQuotaResetMs('Resets in 30s', now), now + 30_000)
+  assert.strictEqual(parseQuotaResetMs('RESETS IN 2M12S', now), now + (2 * 60 + 12) * 1000, '大小写不敏感')
+  assert.strictEqual(parseQuotaResetMs('quota exceeded', now), undefined, '没有这句话就不能编一个')
+  assert.strictEqual(
+    parseQuotaResetMs('Resets in 0s', now),
+    now,
+    '「0 秒后重置」是有效答案：丢掉它会让账号池退回保守的 10 分钟停用'
+  )
+})
+
 await check('配额 429 后同一次调用换下一个账号并成功', async () => {
   const pool = makePool()
   const first = await pool.add(credsOf('a@b.c'))
@@ -1531,6 +1812,29 @@ await check('单账号时 429 的报错文案与文案断言保持原样', async
   const result = await runAdapter(() => new Response(quotaBody, { status: 429 }), pool)
   assert.match(result.error.message, /配额已用尽/)
   assert.match(result.error.message, /1h0m0s/, '重置时间必须留在文案里')
+})
+
+await check('故障转移途中取不到下一个账号时，报出的是第一次的真实故障', async () => {
+  let calls = 0
+  const adapter = new GoogleAntigravityAdapter({
+    resolveCredentials: async () => {
+      calls += 1
+      if (calls === 1) return { access: 'acc1', accountId: 'acc1', email: 'a@x.y' }
+      throw new Error('Connect to oauth2.googleapis.com failed: ETIMEDOUT')
+    }
+  })
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async () => new Response(quotaBody, { status: 429 })
+  try {
+    for await (const _chunk of adapter.stream({ model: 'gemini-3.8-flash', messages: [{ role: 'user', content: 'hi' }] })) {
+      /* drain */
+    }
+    assert.fail('the call must fail')
+  } catch (error) {
+    assert.match(error.message, /配额已用尽/, '真实故障是配额，不能被取下一个账号时的异常盖掉：' + error.message)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
 })
 
 await check('没有任何账号时抛出 MISSING_CREDENTIAL', async () => {

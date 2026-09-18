@@ -353,7 +353,7 @@ export async function exchangeCodeForTokens(
     authorizedAt: Date.now()
   }
 
-  const email = await fetchUserEmail(creds.access, options.signal)
+  const email = await discoverEmail(creds.access, options.signal)
   if (email) creds.email = email
 
   const projectId = await discoverProjectId(creds.access, options.signal)
@@ -361,7 +361,19 @@ export async function exchangeCodeForTokens(
   return creds
 }
 
-async function fetchUserEmail(accessToken: string, signal?: AbortSignal): Promise<string | undefined> {
+/**
+ * Ask Google which account an access token belongs to.
+ *
+ * Exported because identity is not only a sign-in concern: a grant adopted from
+ * a single-account install has no email on file, and the account pool calls this
+ * on that account's first refresh so it can be named — and de-duplicated — instead
+ * of being known forever by its project id.
+ *
+ * @param accessToken - a live access token.
+ * @param signal - abort signal.
+ * @returns the email, or `undefined` when Google does not answer usefully.
+ */
+export async function discoverEmail(accessToken: string, signal?: AbortSignal): Promise<string | undefined> {
   try {
     const res = await fetch(USERINFO_URL, { headers: { Authorization: `Bearer ${accessToken}` }, signal })
     if (!res.ok) return undefined
