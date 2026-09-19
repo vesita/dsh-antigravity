@@ -1,6 +1,6 @@
 {
   "name": "dsh-antigravity",
-  "version": "0.4.3",
+  "version": "0.4.4",
   "description": "适用于 DeepSeek Harness 的 Google Antigravity 模型提供商适配器插件（原生 LlmAdapter + 多账号管理 UI）",
   "type": "module",
   "main": "lib/index.js",

@@ -1416,7 +1416,7 @@ await check('active-first 只用默认账号，直到它不可用', async () => 
   assert.deepStrictEqual(seen, ['d@e.f', 'd@e.f', 'd@e.f'], 'the active account must be drained first')
 })
 
-await check('配额失败会把账号停到重置时间，下一次调用自动换人', async () => {
+await check('配额失败停一个窗口，下一次调用自动换人', async () => {
   const pool = makePool({ strategy: () => 'active-first' })
   await pool.add(credsOf('a@b.c'))
   await pool.add(credsOf('d@e.f'))
@@ -1432,8 +1432,58 @@ await check('配额失败会把账号停到重置时间，下一次调用自动�
   assert.strictEqual(second.email, 'a@b.c', 'a parked account must not be handed out again')
   const parked = pool.list().find(view => view.email === 'd@e.f')
   assert.strictEqual(parked.cooling, true)
-  assert.strictEqual(parked.cooldownSeconds, 3600)
+  assert.strictEqual(parked.cooldownSeconds, 300, '停用封顶 5 分钟：provider 说一小时也只排一个窗口')
   assert.match(parked.lastError, /配额/)
+})
+
+await check('重置时间报 92 小时也只停一个窗口，窗口一过就重新排队', async () => {
+  const pool = makePool()
+  const entry = await pool.add(credsOf('a@b.c'))
+  pool.reportFailure({
+    accountId: entry.id,
+    kind: 'quota',
+    message: 'q',
+    cooldownUntil: clock + 92 * 3600 * 1000
+  })
+  assert.strictEqual(pool.list()[0].cooldownSeconds, 300, '任何重置时间都不许把账号停过 5 分钟')
+  clock += 300_001
+  assert.strictEqual(pool.list()[0].cooling, false, '窗口一过就必须回到队列')
+  const creds = await pool.resolve()
+  assert.strictEqual(creds.email, 'a@b.c', '重新排队，而不是等到 provider 说的那个时刻')
+})
+
+await check('旧版写下的超长冷却在池子启动时被压成一个窗口', async () => {
+  removeAuthFile()
+  const file = pathJoin(accountsHome, `registry-${poolSeq++}-stale.json`)
+  writeAccountRegistry(
+    {
+      version: 1,
+      activeId: 'a@b.c',
+      accounts: [
+        {
+          id: 'a@b.c',
+          label: 'a@b.c',
+          email: 'a@b.c',
+          addedAt: 1,
+          cooldownUntil: clock + 24 * 3600 * 1000,
+          creds: credsOf('a@b.c')
+        }
+      ],
+      updatedAt: 0
+    },
+    file
+  )
+  const pool = new AccountPool({
+    file,
+    now: () => clock,
+    warn: () => {},
+    refresh: async creds => creds,
+    discoverEmail: async () => undefined
+  })
+  await pool.ready()
+  const view = pool.list()[0]
+  assert.strictEqual(view.cooling, true, '纠正不是立即放行：当前这个窗口仍要排完')
+  assert.strictEqual(view.cooldownSeconds, 300, '注册表里的一天长停必须被压成一个窗口：' + view.cooldownSeconds)
 })
 
 await check('账号恢复可用后冷却自动解除', async () => {
@@ -1488,11 +1538,12 @@ await check('重置时间已到时不得把账号停掉', async () => {
   const pool = makePool()
   const entry = await pool.add(credsOf('a@b.c'))
   pool.reportFailure({ accountId: entry.id, kind: 'quota', message: 'q', cooldownUntil: clock - 1 })
-  assert.strictEqual(pool.list()[0].cooldownUntil, null, '已经到点的重置时间不是「停用 10 分钟」')
+  assert.strictEqual(pool.list()[0].cooldownUntil, null, '已经到点的重置时间不是「停用一个窗口」')
   assert.strictEqual(pool.list()[0].cooling, false)
   // 负控：provider 没说重置时间时才用保守默认。
   pool.reportFailure({ accountId: entry.id, kind: 'quota', message: 'q' })
   assert.strictEqual(pool.list()[0].cooling, true)
+  assert.strictEqual(pool.list()[0].cooldownSeconds, 300, '没说重置时间就排一个窗口')
 })
 
 await check('全部账号都刷新失败时，报出的是真实原因而不是「未登录」', async () => {

@@ -42,10 +42,18 @@ import type { AntigravityCredentials, CredentialsSeam, OAuthClientOverrides } fr
 export const ACCOUNT_REGISTRY_VERSION = 1
 
 /** Cooldown applied to a quota failure whose reset time the body did not carry. */
-export const DEFAULT_QUOTA_COOLDOWN_MS = 10 * 60 * 1000
+export const DEFAULT_QUOTA_COOLDOWN_MS = 5 * 60 * 1000
 
-/** Ceiling on any cooldown, so one bad parse cannot park an account forever. */
-export const MAX_QUOTA_COOLDOWN_MS = 24 * 60 * 60 * 1000
+/**
+ * Ceiling on any cooldown, whatever reset time the body claims.
+ *
+ * The pool is a queue, not a write-off: an account that reports a reset still 92
+ * hours away is benched for one short window and then re-tested, so a quota that
+ * comes back earlier than advertised rejoins the rotation instead of being
+ * missed for a day. The price is one request per window while it really is
+ * exhausted — cheaper than not noticing a recovery.
+ */
+export const MAX_QUOTA_COOLDOWN_MS = 5 * 60 * 1000
 
 /**
  * How long an account is skipped after a credential failure (a refresh that came
@@ -525,7 +533,8 @@ export class AccountPool {
 
   /**
    * Adopt a pre-existing single grant, so an upgrading deployment finds its
-   * account already listed.
+   * account already listed, and bring any cooldown the registry already carries
+   * under the current ceiling.
    *
    * Deliberately re-checked rather than done once: the standalone CLI writes the
    * same registry, but a grant written by an *older* build (or by hand) only
@@ -537,13 +546,35 @@ export class AccountPool {
    */
   async ready(): Promise<void> {
     if (this.#adopting !== null) return this.#adopting
-    const adoption = this.#adopt()
+    const adoption = this.#adopt().then(() => this.#shortenStaleCooldowns())
     this.#adopting = adoption
     try {
       await adoption
     } finally {
       if (this.#adopting === adoption) this.#adopting = null
     }
+  }
+
+  /**
+   * Rewrite a cooldown that outlasts the current ceiling.
+   *
+   * The registry is durable and shared with the CLI, so a park written under an
+   * earlier, longer rule would keep an account out of the queue for a day after
+   * that rule changed. Repairing it on the read path — not only where a park is
+   * written — is what makes "never parked longer than
+   * {@link MAX_QUOTA_COOLDOWN_MS}" true of registries that already exist.
+   */
+  #shortenStaleCooldowns(): void {
+    const now = this.#now()
+    const registry = this.#load()
+    let changed = false
+    for (const entry of registry.accounts) {
+      if (typeof entry.cooldownUntil === 'number' && entry.cooldownUntil > now + MAX_QUOTA_COOLDOWN_MS) {
+        entry.cooldownUntil = now + MAX_QUOTA_COOLDOWN_MS
+        changed = true
+      }
+    }
+    if (changed) this.#persist(registry)
   }
 
   async #adopt(): Promise<void> {
@@ -844,9 +875,10 @@ export class AccountPool {
   }
 
   /**
-   * Record an account-scoped failure. A quota failure parks the account until
-   * its reset time (or a conservative default), which is what makes the next
-   * call go to a different account.
+   * Record an account-scoped failure. A quota failure parks the account for one
+   * short window — its reset time, capped — which is what makes the next call go
+   * to a different account, and what makes the pool re-test it in this window
+   * rather than at a reset time it may never reach.
    */
   reportFailure(info: AccountFailureInfo): void {
     if (info.accountId === undefined || info.accountId === ENV_ACCOUNT_ID) return
