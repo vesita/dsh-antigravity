@@ -967,6 +967,31 @@ export class AccountPool {
   }
 
   /**
+   * Drop one account's cooldown so the next call may pick it again.
+   *
+   * A park is the pool's reading of a provider wait, and a reading can be wrong
+   * in both directions: a quota that came back early, or a 429 that was never
+   * about this account. This is the manual override for that — the registry is
+   * the only place a park exists, so clearing it here is exactly what the next
+   * acquisition reads. It clears a credential park the same way, since both are
+   * the same field.
+   *
+   * @param id - account to unpark.
+   * @returns `cleared` when a park was removed, `idle` when there was none,
+   *   `missing` when no account carries that id.
+   */
+  async clearCooldown(id: string): Promise<'cleared' | 'idle' | 'missing'> {
+    await this.ready()
+    const registry = this.#load()
+    const entry = registry.accounts.find(a => a.id === id)
+    if (entry === undefined) return 'missing'
+    if (entry.cooldownUntil === undefined) return 'idle'
+    entry.cooldownUntil = undefined
+    this.#persist(registry)
+    return 'cleared'
+  }
+
+  /**
    * Forget every account — the provider row's 「移除」.
    *
    * The only irreversible path in this module: what it deletes are refresh

@@ -738,6 +738,18 @@ export function apply(ctx: any, config: AntigravitySettings = {}): void {
       sendJson(res, 200, await status())
     })
 
+    // A park is the pool's own guess, so the card offers to drop it. An account
+    // that was not parked is not an error — the answer is the same fresh status.
+    route('POST', `${ROUTE_PREFIX}/accounts/clear-cooldown`, async (req, res) => {
+      const id = await accountId(req)
+      const outcome = id === '' ? 'missing' : await pool.clearCooldown(id)
+      if (outcome === 'missing') {
+        sendJson(res, 404, { error: '未找到该账号' })
+        return
+      }
+      sendJson(res, 200, await status())
+    })
+
     // -----------------------------------------------------------------------
     // Usage panel API — same loopback guard as the auth routes, so the
     // statistics are never readable from outside the browser session.

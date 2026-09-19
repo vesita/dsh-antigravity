@@ -97,6 +97,7 @@ if (command === 'status') {
 } else if (command === 'accounts') {
   const removeId = flag('remove', '')
   const activeId = flag('active', '')
+  const clearId = flag('clear-cooldown', '')
   await pool.ready()
   if (removeId !== '') {
     const removed = await pool.remove(removeId)
@@ -105,6 +106,16 @@ if (command === 'status') {
   if (activeId !== '') {
     const switched = await pool.setActive(activeId)
     console.log(switched ? `默认账号已切换为 ${activeId}` : `未找到账号 ${activeId}`)
+  }
+  if (clearId !== '') {
+    const outcome = await pool.clearCooldown(clearId)
+    console.log(
+      outcome === 'cleared'
+        ? `已清除账号 ${clearId} 的冷却`
+        : outcome === 'idle'
+          ? `账号 ${clearId} 本来就没有冷却`
+          : `未找到账号 ${clearId}`
+    )
   }
   printAccounts()
 } else if (command === 'logout') {

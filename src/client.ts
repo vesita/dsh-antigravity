@@ -75,6 +75,7 @@
       accountsUnit: string
       addAccount: string
       setActive: string
+      clearCooldown: string
       active: string
       cooling: string
       recoversIn: string
@@ -107,6 +108,7 @@
           accountsUnit: '个账号',
           addAccount: '添加账号',
           setActive: '设为默认',
+          clearCooldown: '清除冷却',
           active: '默认',
           cooling: '配额冷却中',
           recoversIn: '约',
@@ -132,6 +134,7 @@
           accountsUnit: 'accounts',
           addAccount: 'Add account',
           setActive: 'Make default',
+          clearCooldown: 'Clear cooling',
           active: 'Default',
           cooling: 'Quota cooling',
           recoversIn: 'back in ~',
@@ -363,6 +366,10 @@
       const removeAccount = (id: string) =>
         run(() => call('/accounts/remove', { method: 'POST', body: JSON.stringify({ id }) }))
 
+      /** Drop one account's cooldown so the next call may pick it again. */
+      const clearCooldown = (id: string) =>
+        run(() => call('/accounts/clear-cooldown', { method: 'POST', body: JSON.stringify({ id }) }))
+
       /**
        * One installed account: identity, health, and what can be done to it.
        *
@@ -419,6 +426,19 @@
                   },
                   copy.setActive
                 ),
+            cooling
+              ? h(
+                  Button,
+                  {
+                    key: 'cool',
+                    variant: 'outline',
+                    size: 'sm',
+                    disabled: busy,
+                    onClick: () => clearCooldown(account.id)
+                  },
+                  copy.clearCooldown
+                )
+              : null,
             h(
               Button,
               {

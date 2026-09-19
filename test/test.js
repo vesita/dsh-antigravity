@@ -830,11 +830,12 @@ const CANCEL = '/dsh-antigravity/auth/cancel'
 const LOGOUT = '/dsh-antigravity/auth/logout'
 const ACCOUNTS = '/dsh-antigravity/auth/accounts'
 const ACCOUNTS_ACTIVE = '/dsh-antigravity/auth/accounts/active'
+const ACCOUNTS_CLEAR = '/dsh-antigravity/auth/accounts/clear-cooldown'
 const ACCOUNTS_REMOVE = '/dsh-antigravity/auth/accounts/remove'
 
 await check('the host registers exactly the routes the card calls', () => {
   const authPaths = [...registeredPaths].filter(entry => entry.startsWith('/dsh-antigravity/auth')).sort()
-  assert.deepStrictEqual(authPaths, [ACCOUNTS, ACCOUNTS_ACTIVE, ACCOUNTS_REMOVE, CANCEL, LOGIN, LOGOUT, STATUS])
+  assert.deepStrictEqual(authPaths, [ACCOUNTS, ACCOUNTS_ACTIVE, ACCOUNTS_CLEAR, ACCOUNTS_REMOVE, CANCEL, LOGIN, LOGOUT, STATUS])
   const usagePaths = [...registeredPaths].filter(entry => entry.startsWith('/dsh-antigravity/usage')).sort()
   assert.deepStrictEqual(usagePaths, [
     '/dsh-antigravity/usage/backfill',
@@ -963,6 +964,45 @@ await check('multi: /accounts/remove deletes one and closes the loop on the last
   assert.strictEqual(readAuthFile(), null)
   const missing = await request('POST', ACCOUNTS_REMOVE, { body: { id: 'id-a' } })
   assert.strictEqual(missing.status, 404)
+})
+await check('multi: /accounts/clear-cooldown drops the park and /status follows', async () => {
+  writeAccountRegistry(
+    {
+      version: 1,
+      activeId: 'id-a',
+      accounts: [
+        { ...seededAccount('id-a', 'a@b.c', 'proj-a'), cooldownUntil: Date.now() + 3_600_000 },
+        seededAccount('id-b', 'd@e.f', 'proj-b')
+      ],
+      updatedAt: 0
+    },
+    accountsFilePath()
+  )
+  const listed = await request('GET', ACCOUNTS)
+  assert.strictEqual(
+    listed.body.accounts.find(a => a.id === 'id-a').cooling,
+    true,
+    '先让它真的处在冷却里'
+  )
+  const cleared = await request('POST', ACCOUNTS_CLEAR, { body: { id: 'id-a' } })
+  assert.strictEqual(cleared.status, 200)
+  assert.strictEqual(
+    cleared.body.accounts.find(a => a.id === 'id-a').cooling,
+    false,
+    '冷却必须被清掉'
+  )
+  assert.strictEqual(
+    cleared.body.accounts.find(a => a.id === 'id-b').cooling,
+    false,
+    '清一个账号不能碰到别人的冷却状态'
+  )
+  const missing = await request('POST', ACCOUNTS_CLEAR, { body: { id: 'nope' } })
+  assert.strictEqual(missing.status, 404)
+  assert.match(missing.body.error, /未找到/)
+  // 下一节从「这台机器上还没有账号」开始，所以把这一段借来的两条还回去。
+  await request('POST', ACCOUNTS_REMOVE, { body: { id: 'id-a' } })
+  const emptied = await request('POST', ACCOUNTS_REMOVE, { body: { id: 'id-b' } })
+  assert.strictEqual(emptied.body.accounts.length, 0)
 })
 await check('teardown during a pending attempt releases every route', async () => {
   const { body } = await request('POST', LOGIN)
@@ -1484,6 +1524,19 @@ await check('旧版写下的超长冷却在池子启动时被压成一个窗口'
   const view = pool.list()[0]
   assert.strictEqual(view.cooling, true, '纠正不是立即放行：当前这个窗口仍要排完')
   assert.strictEqual(view.cooldownSeconds, 300, '注册表里的一天长停必须被压成一个窗口：' + view.cooldownSeconds)
+})
+
+await check('手动清除冷却：清掉后下一次调用立刻轮得到它', async () => {
+  const pool = makePool()
+  const entry = await pool.add(credsOf('a@b.c'))
+  pool.reportFailure({ accountId: entry.id, kind: 'quota', message: 'q', cooldownUntil: clock + 3_600_000 })
+  assert.strictEqual(pool.list()[0].cooling, true)
+  assert.strictEqual(await pool.clearCooldown(entry.id), 'cleared')
+  assert.strictEqual(pool.list()[0].cooling, false)
+  const creds = await pool.resolve()
+  assert.strictEqual(creds.email, 'a@b.c', '冷却清掉之后必须重新轮得到它')
+  assert.strictEqual(await pool.clearCooldown(entry.id), 'idle', '本来没冷却时如实回答')
+  assert.strictEqual(await pool.clearCooldown('nope'), 'missing', '不存在的账号要能区分出来')
 })
 
 await check('账号恢复可用后冷却自动解除', async () => {

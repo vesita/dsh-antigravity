@@ -54,7 +54,7 @@ DeepSeek Harness (DSH) 的 **Google Antigravity** 模型提供商插件：原生
 | --- | --- | --- |
 | 可用 | 绿点 + 邮箱 + 项目 + 令牌有效期 | 下一次调用可能落到它头上 |
 | 默认 | 邮箱后的 **默认** 胶囊 | 镜像文件与 `ctx.credentials` 记录跟它；`active-first` 下先用它 |
-| 配额冷却 | 黄点 + 配额冷却中，约 N 分钟后恢复 | 冷却期内的调用跳过它；N 封顶 5 分钟，到点自动回到队列 |
+| 配额冷却 | 黄点 + 配额冷却中，约 N 分钟后恢复 + **清除冷却**按钮 | 冷却期内的调用跳过它；N 封顶 5 分钟，到点自动回到队列。冷却只是池子对 provider 等待的读数，觉得读错了就按这个按钮清掉它 |
 | 令牌过期 | 红点 + 登录已过期，请重新登录 | 刷新也救不回来（refresh token 失效），需要重新登录这个账号 |
 
 `account` 是**目录标记，不是凭据**：它只记一个可读的标签（邮箱或项目 ID），真正的授权在 `ctx.credentials` 里。两条规则保证两者一致：
@@ -99,6 +99,7 @@ $D login                        # 浏览器 OAuth 登录，并登记为默认账
 $D accounts                     # 列出全部账号（默认 / 冷却 / 过期一目了然）
 $D accounts --active <id>       # 换默认账号
 $D accounts --remove <id>       # 移除某个账号
+$D accounts --clear-cooldown <id>  # 手动清掉某个账号的冷却，让它下一个窗口就能被选中
 $D status                       # 查看认证状态、账号列表与模型列表
 $D logout                       # 清除全部账号
 $D logout --account <id>        # 只清除某个账号
