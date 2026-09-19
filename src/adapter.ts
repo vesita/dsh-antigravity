@@ -504,14 +504,18 @@ export class GoogleAntigravityAdapter extends LlmAdapter {
         clearTimeout(timer)
         if (res.ok && res.body) return res
         const body = await res.text().catch(() => '')
+        const code = httpCode(res.status, body)
         const error = new LlmError(
           res.status === 429 ? quotaMessage(base, res.status, body) : `Antigravity 端点 ${base} 返回 ${res.status}: ${body.slice(0, 500)}`,
-          httpCode(res.status)
+          code
         ) as LlmError & { retryAtMs?: number }
-        // A 429 body usually says when the quota resets. Keep that as a fact on
-        // the error so the pool can park this account for exactly that long
-        // instead of guessing, and so the next call goes elsewhere.
-        if (res.status === 429) {
+        // A *quota* 429 body usually says when the quota resets. Keep that as a
+        // fact on the error so the pool can park this account for exactly that
+        // long instead of guessing, and so the next call goes elsewhere. A 429
+        // the body does not explain is `RATE_LIMIT` instead: it is no more this
+        // account's fault than the endpoint's, so nothing is parked, no cooldown
+        // is invented, and the retry policy gets to try again.
+        if (code === 'QUOTA_EXCEEDED') {
           const retryAt = parseQuotaResetMs(body)
           if (retryAt !== undefined) error.retryAtMs = retryAt
           scopedError = scopedError ?? error
@@ -596,9 +600,39 @@ export function parseQuotaResetMs(body: string, now: number = Date.now()): numbe
   return ms >= 0 ? now + ms : undefined
 }
 
-function httpCode(status: number): string {
+/**
+ * Whether a 429 body is the provider naming *quota* exhaustion.
+ *
+ * The status code alone cannot separate the two 429s this endpoint returns: the
+ * quota one (`Individual quota reached`, `RESOURCE_EXHAUSTED`, carrying a
+ * `Resets in …`) and a transient one (a throttle or a gateway hiccup). Only the
+ * body tells them apart, so both the wording and the failure category below read
+ * this single predicate — widening or narrowing it moves both together.
+ *
+ * @param body - raw 429 response text.
+ * @returns whether the body names quota exhaustion.
+ */
+function isQuotaBody(body: string): boolean {
+  return /QUOTA_EXHAUSTED|Individual quota reached|Resource has been exhausted/i.test(String(body || ''))
+}
+
+/**
+ * Map a response to the DSH provider-neutral failure code.
+ *
+ * A 429 is split by body. Quota exhaustion becomes `QUOTA_EXCEEDED`, which is
+ * deliberately outside `dsh-llm-retry`'s retryable set: the wait is measured in
+ * minutes-to-hours, so retrying it would only spend the budget. A 429 the body
+ * does *not* explain is not the account's quota at all — it becomes
+ * `RATE_LIMIT`, a code the default retry policy does own, so DSH retries it with
+ * backoff and the pool records a non-parking failure.
+ *
+ * @param status - HTTP status.
+ * @param body - raw response text, needed to tell the two 429s apart.
+ * @returns the DSH failure code.
+ */
+function httpCode(status: number, body = ''): string {
   if (status === 401 || status === 403) return 'INVALID_CREDENTIAL'
-  if (status === 429) return 'QUOTA_EXCEEDED'
+  if (status === 429) return isQuotaBody(body) ? 'QUOTA_EXCEEDED' : 'RATE_LIMIT'
   if (status >= 500) return 'TRANSPORT'
   return 'INVALID_REQUEST'
 }
@@ -613,10 +647,12 @@ function httpCode(status: number): string {
  * So the body already carries the two facts that matter (it is quota, and when it
  * resets); the raw JSON blob was just burying them.
  *
- * Deliberately **not** changing the code to `RATE_LIMIT`: that would put these
- * failures into `dsh-llm-retry`'s retryable set and spend the retry budget on a
- * wait measured in minutes-to-hours. Surfacing the wait is the useful fix; the
- * raw body is kept (truncated) so nothing is hidden.
+ * Only the quota form keeps `QUOTA_EXCEEDED`: retrying a wait measured in
+ * minutes-to-hours would just spend the budget, so surfacing it is the fix. The
+ * 429s that sample did *not* contain — a throttle or a gateway hiccup, which no
+ * amount of waiting for a reset would explain — now take `RATE_LIMIT` instead
+ * (see {@link httpCode}) and are retried. The raw body is kept (truncated) so
+ * nothing is hidden.
  *
  * The parsed reset instant also travels on the error (`retryAtMs`) so the
  * multi-account pool can park this account for exactly that long — and with a
@@ -630,7 +666,7 @@ function httpCode(status: number): string {
 function quotaMessage(base: string, status: number, body: string): string {
   const raw = String(body || '')
   const head = `Antigravity 端点 ${base} 返回 ${status}`
-  const isQuota = /QUOTA_EXHAUSTED|Individual quota reached|Resource has been exhausted/i.test(raw)
+  const isQuota = isQuotaBody(raw)
   if (!isQuota) return `${head}: ${raw.slice(0, 500)}`
   // Same shape as {@link parseQuotaResetMs}: hours, minutes and seconds are each
   // optional, because Google writes `45m` as readily as `1h31m29s`, and a regex

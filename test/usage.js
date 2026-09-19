@@ -867,12 +867,14 @@ check('401 立刻收手（被拒的凭据在每个端点上都会被拒）', () 
   assert.strictEqual(badToken.failure.code, 'INVALID_CREDENTIAL')
 })
 
-check('负向对照：非配额语义的 429 保持原始响应，不被扣上"配额"帽子', async () => {
+check('负向对照：非配额语义的 429 不戴"配额"帽子，也不进不可重试集合', async () => {
   const odd = await observeCall({ fetch: async () => new Response('{"error":{"message":"weird throttling"}}', { status: 429 }) })
   const message = String(odd.failure && odd.failure.message)
   assert.ok(!message.includes('配额已用尽'), message)
   assert.ok(message.includes('weird throttling'), message)
-  assert.strictEqual(odd.failure.code, 'QUOTA_EXCEEDED')
+  // 报文说不是配额，code 就必须同样说不是配额：QUOTA_EXCEEDED 不在
+  // dsh-llm-retry 的 retryableCodes 里，扣上去等于这种 429 永远不会自动重试。
+  assert.strictEqual(odd.failure.code, 'RATE_LIMIT')
 })
 
 console.log(`\n用量模型测试全部通过：${passed} 项`)

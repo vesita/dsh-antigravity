@@ -1814,6 +1814,61 @@ await check('单账号时 429 的报错文案与文案断言保持原样', async
   assert.match(result.error.message, /1h0m0s/, '重置时间必须留在文案里')
 })
 
+await check('真实配额报文（Resets in + RESOURCE_EXHAUSTED + reason）仍判为配额', async () => {
+  const real = JSON.stringify({
+    error: {
+      code: 429,
+      message: 'Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 26m31s.',
+      status: 'RESOURCE_EXHAUSTED',
+      details: [{ '@type': 'type.googleapis.com/google.rpc.ErrorInfo', reason: 'QUOTA_EXCEEDED' }]
+    }
+  })
+  const pool = makePool()
+  await pool.add(credsOf('a@b.c'))
+  const before = Date.now()
+  const result = await runAdapter(() => new Response(real, { status: 429 }), pool)
+  assert.strictEqual(result.error.code, 'QUOTA_EXCEEDED', '配额必须留在不可重试集合之外')
+  assert.match(result.error.message, /配额已用尽/)
+  assert(
+    result.error.retryAtMs >= before + 26 * 60 * 1000 && result.error.retryAtMs <= before + 27 * 60 * 1000,
+    `26m31s 必须被解析成冷却时间，实际 ${result.error.retryAtMs}`
+  )
+  assert.strictEqual(pool.list()[0].cooling, true, '真配额用尽就该停用这个账号')
+})
+
+await check('429 但报文不是配额：编成 RATE_LIMIT 交给 DSH 重试，账号不停用', async () => {
+  const pool = makePool()
+  await pool.add(credsOf('a@b.c'))
+  // 报文里没有任何配额字样：这是被限流/网关抖动，等一个「重置时间」没有意义。
+  const transient = '{"error":{"code":429,"message":"Rate Limit Exceeded"}}'
+  const result = await runAdapter(() => new Response(transient, { status: 429 }), pool)
+  assert(result.error, '全部端点都失败后仍然要把错误抛出来')
+  assert.strictEqual(
+    result.error.code,
+    'RATE_LIMIT',
+    'dsh-llm-retry 的 retryableCodes 默认含 RATE_LIMIT；编成 QUOTA_EXCEEDED 就永远不会自动重试'
+  )
+  assert.strictEqual(result.error.retryAtMs, undefined, '非配额 429 不能凭空编一个冷却时间')
+  assert.doesNotMatch(result.error.message, /配额已用尽/, '文案不能把限流说成配额用尽')
+  assert(
+    pool.list().every(view => view.cooling === false),
+    '报文没说配额用尽就不许停用账号，否则有余额的账号会被静默跳过'
+  )
+  assert(
+    result.failures.every(failure => failure.kind === 'other'),
+    `非配额 429 只能记成 other：${JSON.stringify(result.failures)}`
+  )
+})
+
+await check('负控：配额 429 依旧被停用，不被上面的分流放过', async () => {
+  const pool = makePool()
+  await pool.add(credsOf('a@b.c'))
+  const result = await runAdapter(() => new Response(quotaBody, { status: 429 }), pool)
+  assert.strictEqual(result.error.code, 'QUOTA_EXCEEDED')
+  assert.strictEqual(result.failures[0].kind, 'quota')
+  assert.strictEqual(pool.list()[0].cooling, true)
+})
+
 await check('故障转移途中取不到下一个账号时，报出的是第一次的真实故障', async () => {
   let calls = 0
   const adapter = new GoogleAntigravityAdapter({
