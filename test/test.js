@@ -452,7 +452,7 @@ await check('apply registers the provider-card cell', () => {
     }
   }
   clientExports.apply(fakeCtx)
-  assert.deepStrictEqual(injections, ['settings.models.provider-card', 'settings.section'])
+  assert.deepStrictEqual(injections, ['settings.models.provider-card', 'conversation.view'])
   const card = registrations.find(entry => entry.options.name === 'settings.models.provider-card')
   assert.strictEqual(card.options.key, 'llm-antigravity')
   assert.strictEqual(typeof card.component, 'function')
@@ -479,21 +479,21 @@ async function applyWithAccount(authenticated) {
   return registrations
 }
 
-await check('没有账户时不注册用量页', async () => {
+await check('没有账户时不注册用量 tab', async () => {
   const registrations = await applyWithAccount(false)
   assert.strictEqual(
-    registrations.find(entry => entry.options.name === 'settings.section'),
+    registrations.find(entry => entry.options.name === 'conversation.view'),
     undefined,
-    'an account-less install must not show the usage page'
+    'an account-less install must not show the usage tab'
   )
 })
 
-await check('有账户时注册用量页', async () => {
+await check('有账户时注册用量 tab', async () => {
   const registrations = await applyWithAccount(true)
-  const usage = registrations.find(entry => entry.options.name === 'settings.section')
-  assert.ok(usage, 'an installed account must show the usage page')
+  const usage = registrations.find(entry => entry.options.name === 'conversation.view')
+  assert.ok(usage, 'an installed account must show the usage tab')
   assert.strictEqual(usage.options.id, 'antigravity-usage')
-  assert.strictEqual(usage.options.order, 30)
+  assert.strictEqual(usage.options.order, 20)
   assert.strictEqual(typeof usage.options.label, 'function')
   assert.strictEqual(typeof usage.component, 'function')
 })

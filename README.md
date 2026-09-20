@@ -148,11 +148,13 @@ dsh-antigravity proxy --port 8045
 适配器把词元数、首字延迟（TTFT）、总时长、终止原因交给采集器，落进
 `~/.dsh/antigravity-usage.db`（`node:sqlite`，0600，不引入任何依赖）。
 
-**只有装了账户的人才会看到这一页。** `settings.section` 没有逐项的可见性开关，所以门禁就是
-注册本身：浏览器半启动时探测一次宿主（设置标记或已存凭据），只有拿到「已登录」才把
-**设置 → 用量统计** 注册进设置导航；没账户的安装看不到它，而不是看到一个永远空着的页面。
+**只有装了账户的人才会看到这个 tab。** 用量表是主区域的一级 tab（`conversation.view`，
+排在「对话」「轨迹」之后），不是设置页 —— 报表要的是宽度，设置导航给不了。这个槽位没有
+逐项的可见性开关，所以门禁就是注册本身：浏览器半启动时探测一次宿主（设置标记或已存凭据），
+只有拿到「已登录」才把 **「用量」** tab 注册进去；没账户的安装看不到它，而不是看到一个
+永远空着的 tab。
 
-打开这一页就会**自动统计**（见下），你不需要先按任何按钮：
+打开这个 tab 就会**自动统计**（见下），你不需要先按任何按钮：
 
 | 区块 | 内容 |
 | --- | --- |
@@ -271,7 +273,7 @@ export DSH_ANTIGRAVITY_CLIENT_SECRET=...
 src/                      TypeScript 源码（NodeNext 风格，import 写 ./x.js）
 ├── index.ts           Host 插件：自有 settings 命名空间、原生适配器注册、
 │                      authorization 登录 flow、/dsh-antigravity/{auth,usage}/* 回环路由、可选代理
-├── client.ts          浏览器半：提供方卡片内的多账号管理 UI + 设置页「用量统计」面板
+├── client.ts          浏览器半：提供方卡片内的多账号管理 UI + 主区域「用量」tab 面板
 ├── adapter.ts         原生 LlmAdapter：请求构造 + SSE → DSH StreamChunk、跨账号故障转移，并观测每次调用
 ├── accounts.ts        多账号注册表与账号池：清单持久化、选择策略、配额冷却、旧单账号迁移
 ├── usage-model.ts     纯函数用量模型：词元桶、成本、时间窗、聚合、分桶、分组
@@ -301,7 +303,7 @@ lib/                      tsc 构建产物（git 忽略，随 npm 包发布）
 - `ctx.authorization.registerFlow({ key, label, methods, run })` — 无头/ACP 登录；
 - `ctx.webServer.register({ kind: 'exact', path: '/dsh-antigravity/auth/...' })` — 浏览器登录回环路由：`status` / `login` / `cancel` / `logout` / `accounts` / `accounts/active` / `accounts/remove`（经 `ctx.connection.requestRejection` 校验）；
 - `settings.models.provider-card` 键 `llm-antigravity` — 卡片扩展区；
-- `settings.section` id `antigravity-usage` — 设置页「用量统计」；
+- `conversation.view` id `antigravity-usage` — 主区域「用量」tab（order 20，在「对话」「轨迹」之后）；
 - `ctx.webServer.register({ kind: 'exact', path: '/dsh-antigravity/usage/…' })` — 用量 API，与登录路由共用同一 guard；
 - `ctx.get('sessions')` — 只读地用会话 header 补齐工作目录与「主 / 子代理」标记，服务缺席时降级为空。
 

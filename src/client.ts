@@ -529,6 +529,7 @@
     const usageCopy = zh
       ? {
           title: 'Antigravity 用量',
+          tabLabel: '用量',
           requests: '请求数',
           totalTokens: '总词元',
           cacheRate: '缓存命中率',
@@ -580,6 +581,7 @@
         }
       : {
           title: 'Antigravity usage',
+          tabLabel: 'Usage',
           requests: 'Requests',
           totalTokens: 'Total tokens',
           cacheRate: 'Cache rate',
@@ -700,6 +702,7 @@
 
     const usageStyles = {
       wrap: { display: 'flex', flexDirection: 'column', gap: '14px', padding: '4px 0' },
+      viewRoot: { flex: '1 1 0', minHeight: 0, overflowY: 'auto', padding: '16px 20px' },
       toolbar: { display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' },
       spacer: { flex: '1 1 auto' },
       meta: { fontSize: '12px', lineHeight: '18px', color: 'var(--dsw-alias-label-secondary)' },
@@ -859,7 +862,7 @@
       )
     }
 
-    /** Settings → usage page. Reads the host routes; holds no accounting logic. */
+    /** The usage report body. Reads the host routes; holds no accounting logic. */
     function AntigravityUsagePanel(props: any) {
       const [range, setRange] = React.useState('24h')
       const [data, setData] = React.useState(null)
@@ -1170,6 +1173,15 @@
       )
     }
 
+    /**
+     * The usage report as a Conversation View tab. The conversation shell hands
+     * a view the whole main area and hides its own overflow, so the tab owns its
+     * scrolling and page padding; the report itself is unchanged.
+     */
+    function AntigravityUsageView(props: any) {
+      return h('div', { style: usageStyles.viewRoot }, h(AntigravityUsagePanel, props))
+    }
+
     const inject = ['slots']
 
     function apply(ctx: any) {
@@ -1183,25 +1195,27 @@
         )
       )
       /**
-       * The usage page is offered only to a user who has an Antigravity
-       * account. `settings.section` has no per-entry visibility switch, so the
-       * gate *is* the registration: probe the host once, register only on a
-       * true answer, and keep the probe cancelable so an unmounting fiber can
-       * never leave a late registration behind.
+       * The usage report is a Conversation View tab, not a Settings page: a
+       * report needs the width the main area has and the Settings nav does not.
+       * `conversation.view` has no per-entry visibility switch, so the gate
+       * *is* the registration: probe the host once, register only on a true
+       * answer, and keep the probe cancelable so an unmounting fiber can never
+       * leave a late registration behind.
        */
-      ctx.slots.inject('settings.section', () => {
+      ctx.slots.inject('conversation.view', () => {
         let dispose = null
         let cancelled = false
         probeAccount().then(authenticated => {
           if (cancelled || !authenticated) return
           dispose = ctx.slots.register(
             {
-              name: 'settings.section',
+              name: 'conversation.view',
               id: 'antigravity-usage',
-              order: 30,
-              label: () => usageCopy.title
+              // After the shell's own Chat (0) and Trajectory (10).
+              order: 20,
+              label: () => usageCopy.tabLabel
             },
-            AntigravityUsagePanel
+            AntigravityUsageView
           )
         })
         return () => {
@@ -1231,6 +1245,7 @@
     exports.inject = inject
     exports.AntigravityCard = AntigravityCard
     exports.AntigravityUsagePanel = AntigravityUsagePanel
+    exports.AntigravityUsageView = AntigravityUsageView
     return module.exports
   }
 })
