@@ -2,6 +2,7 @@ import assert from 'node:assert'
 import { Context } from '@deepseek-ai/cordis'
 import { createVolatile, updateVolatile } from '@deepseek-ai/cosmokit'
 import { LlmRuntime } from '@deepseek-ai/dsh-llm'
+import Schema from '@deepseek-ai/schemastery'
 import { GoogleAntigravityAdapter, buildRequest, mapUsage, parseQuotaResetMs, parseStream } from '../lib/adapter.js'
 import {
   CREDENTIAL_KEY,
@@ -17,7 +18,7 @@ import {
 } from '../lib/auth.js'
 import { MODEL_CATALOG, resolveModelSpec } from '../lib/models.js'
 import { toAntigravityToolSchema } from '../lib/tool-schema.js'
-import antigravityPlugin, { version as antigravityVersion } from '../lib/index.js'
+import antigravityPlugin, { Config as AntigravityConfig, version as antigravityVersion } from '../lib/index.js'
 
 /**
  * Every test that touches credentials must stay inside a throwaway `DSH_HOME`:
@@ -445,6 +446,7 @@ const fakePrimitives = {
   Button: 'button',
   SettingsForm: 'SettingsForm',
   SettingsValueField: 'SettingsValueField',
+  Switch: 'Switch',
   settingsNumberField: field => ({
     field,
     format: value => (typeof value === 'number' ? String(value) : ''),
@@ -545,14 +547,50 @@ await check('apply registers the provider-card cell', () => {
 })
 
 /**
+ * The `settingsSchema` service's introspection surface, over the real
+ * schemastery library: the envelope a test serves is parsed by the same library
+ * the Host serializes with, so the client's schema read is exercised end to end.
+ * `nodeAtPath` mirrors the service's object walk.
+ */
+const settingsSchemaFace = {
+  rehydrate: envelope => Schema(envelope),
+  nodeAtPath(root, path) {
+    let node = root
+    for (const key of path) {
+      if (node === undefined || node.type !== 'object') return undefined
+      node = node.dict?.[key]
+    }
+    return node
+  }
+}
+
+/**
+ * One describe-mirror row for this plugin's profile entry, carrying the Host
+ * `Config`'s own serialized schema — exactly what the settings service serves the
+ * browser, which is where the strategy dropdown reads its choices from.
+ *
+ * @param schema - the schema to serve; defaults to the real Host `Config`.
+ * @returns the namespace row the mirror lists.
+ */
+function configNamespaceView(schema = AntigravityConfig) {
+  return { ns: 'antigravity', schema: schema.toJSON(), value: {}, autoGenerate: false, applies: 'live' }
+}
+
+/**
  * Run `apply` with a `configForms` service standing in for the real one, so the
  * config card's registration and baked-in contract can be inspected.
  *
  * The fake records the namespace it was asked for and exposes a scope shaped
  * like the real controller's snapshot (`value` / `base` / `user`), which is what
- * `SettingsFormModel` reads.
+ * `SettingsFormModel` reads. Passing `namespaceView` also stands up the shared
+ * describe mirror and the `settingsSchema` service the real deployment serves
+ * beside `configForms`, so a card that reads its choices out of the namespace
+ * schema can be exercised.
+ *
+ * @param namespaceView - one describe-mirror row, or undefined for a deployment
+ *   that serves no schema at all.
  */
-function applyWithConfigForms() {
+function applyWithConfigForms(namespaceView) {
   const requested = []
   const registrations = []
   const effects = []
@@ -565,13 +603,26 @@ function applyWithConfigForms() {
           subscribe: () => () => {},
           mutate: async () => true
         }
-      }
+      },
+      // The shared describe mirror every settings surface derives from.
+      describe: () => ({
+        getSnapshot: () => ({
+          status: namespaceView === undefined ? 'idle' : 'ready',
+          view:
+            namespaceView === undefined
+              ? undefined
+              : { namespaces: [namespaceView], writable: true, hasDocument: true }
+        })
+      })
     },
     effect(fn) {
       effects.push(fn)
       return () => {}
     },
-    get: () => undefined,
+    // The schema service ships beside `configForms`; a deployment that omits it
+    // gets no choices, which is the text-field path.
+    get: name =>
+      namespaceView === undefined || name !== 'settingsSchema' ? undefined : settingsSchemaFace,
     slots: {
       inject(key, callback) {
         callback()
@@ -676,6 +727,193 @@ await check('插件页配置卡自带账号与登录界面', () => {
     findByType(tree, clientExports.AntigravityCard),
     '插件页的配置卡必须自己带上账号/登录界面，而不是只在「设置 → 模型」里'
   )
+})
+
+/** One field state as the store projects it. */
+const fieldState = (text, overridden = false, invalid = false) => ({ text, overridden, invalid })
+
+/** The state a fresh install projects: Host defaults, nothing overridden. */
+function freshConfigState() {
+  return {
+    shell: { available: true, writable: true, dirty: false, invalid: false, saving: false, failed: false },
+    accountStrategy: fieldState('round-robin'),
+    reasoningEffort: fieldState(''),
+    proxyEnabled: fieldState('off'),
+    proxyHost: fieldState(''),
+    proxyPort: fieldState(''),
+    usageEnabled: fieldState('on'),
+    usageRetentionDays: fieldState('')
+  }
+}
+
+/** The card's props: the store hook over `state`, plus the injected actions. */
+function configCardProps(state, actions = {}) {
+  return Object.assign(
+    {
+      useAntigravityConfig: selector => selector(state),
+      edit: () => {},
+      resetField: () => {},
+      save: () => {},
+      discard: () => {}
+    },
+    actions
+  )
+}
+
+/** Every node created from `type` in a fake element tree, depth-first. */
+function collectByType(node, type, out = []) {
+  if (node == null || typeof node !== 'object') return out
+  if (Array.isArray(node)) {
+    for (const child of node) collectByType(child, type, out)
+    return out
+  }
+  if (node.type === type) out.push(node)
+  collectByType(node.props && node.props.children, type, out)
+  return out
+}
+
+/** The config card's rendered tree for one describe-mirror row. */
+function renderConfigCard(namespaceView, state = freshConfigState(), actions = {}) {
+  const { registrations } = applyWithConfigForms(namespaceView)
+  const entry = registrations.find(r => r.options.name === 'plugins.bundle.config')
+  return entry.component(configCardProps(state, actions))
+}
+
+console.log('# 6.1 插件页配置卡：控件按字段类型选（策略=下拉框，布尔=开关）')
+
+await check('账号池策略渲染成下拉框，选项就是 Host Config 自己声明的 union', () => {
+  const select = findByType(renderConfigCard(configNamespaceView()), 'select')
+  assert.ok(select, '账号池策略必须是下拉框：手输 round-robin 是这次要改掉的形状')
+  assert.strictEqual(select.props.id, 'accountStrategy')
+  // The options are read out of the namespace schema the settings service serves
+  // for this entry, so the Host `Config`'s union stays the one declaration.
+  const union = Schema(AntigravityConfig.toJSON()).dict.accountStrategy
+  assert.deepStrictEqual(
+    select.props.children.map(option => option.props.value),
+    union.list.map(member => member.value)
+  )
+  // And the Host declares exactly these two today, so the control shows both.
+  assert.deepStrictEqual(
+    select.props.children.map(option => option.props.value),
+    ['round-robin', 'active-first']
+  )
+})
+
+await check('下拉框的选项跟着 schema 走，不是客户端写死的两个', () => {
+  const synthetic = Schema.object({
+    accountStrategy: Schema.union(['round-robin', 'active-first', 'least-used']).default('round-robin')
+  })
+  const select = findByType(renderConfigCard(configNamespaceView(synthetic)), 'select')
+  assert.deepStrictEqual(
+    select.props.children.map(option => option.props.value),
+    ['round-robin', 'active-first', 'least-used'],
+    'schema 里多一个值，下拉框就多一个选项'
+  )
+})
+
+await check('控件按 schema 分工：策略是下拉框、两个布尔是开关、其余是文本框', () => {
+  const tree = renderConfigCard(configNamespaceView())
+  assert.strictEqual(collectByType(tree, 'select').length, 1, '只有账号池策略该变成下拉框')
+  assert.strictEqual(collectByType(tree, 'Switch').length, 2, 'proxyEnabled 与 usageEnabled 该是两个开关')
+  assert.strictEqual(
+    collectByType(tree, 'SettingsValueField').length,
+    4,
+    '其余四个字段仍走官方 SettingsValueField'
+  )
+})
+
+/** `collectByType` 之外：按渲染顺序抽出「标题」——官方字段的 label、组标题、可见文本。 */
+function titleOrder(node, out = []) {
+  if (node == null || typeof node !== 'object') return out
+  if (Array.isArray(node)) {
+    for (const child of node) titleOrder(child, out)
+    return out
+  }
+  if (typeof node.props.label === 'string') out.push(node.props.label)
+  else if (typeof node.props.children === 'string') out.push(node.props.children)
+  titleOrder(node.props.children, out)
+  return out
+}
+
+await check('设置项按功能分三组，顺序与父子相邻', () => {
+  const tree = renderConfigCard(configNamespaceView())
+  // The walk is depth-first, so the sequence is the render order — which is what
+  // the grouping promises: each switch sits with the fields it governs, and the
+  // groups run in the order a user meets them.
+  const titles = titleOrder(tree)
+  const order = [
+    '账号与请求', '账号池策略', '思考强度',
+    '兼容代理', '启用兼容代理', '代理监听地址', '代理端口',
+    '用量统计', '启用用量统计', '用量保留天数'
+  ]
+  let at = -1
+  for (const item of order) {
+    const next = titles.indexOf(item, at + 1)
+    assert.ok(next > at, `「${item}」不在预期位置：${JSON.stringify(titles)}`)
+    at = next
+  }
+})
+
+await check('布尔开关的初值来自生效中的值，切换即暂存 on/off', () => {
+  const calls = []
+  const state = freshConfigState()
+  state.proxyEnabled = fieldState('off')
+  state.usageEnabled = fieldState('on')
+  const tree = renderConfigCard(configNamespaceView(), state, {
+    edit: (field, text) => calls.push(['edit', field, text])
+  })
+  const switches = collectByType(tree, 'Switch')
+  assert.deepStrictEqual(
+    Object.fromEntries(switches.map(node => [node.props.label, node.props.checked])),
+    { '启用兼容代理': false, '启用用量统计': true }
+  )
+  switches.find(node => node.props.label === '启用兼容代理').props.onChange(true)
+  assert.deepStrictEqual(calls, [['edit', 'proxyEnabled', 'on']], '开关只暂存，不直接写 Host')
+})
+
+await check('只读或保存中的文档里，三种控件都被禁用', () => {
+  const readonly = freshConfigState()
+  readonly.shell = Object.assign({}, readonly.shell, { writable: false })
+  const tree = renderConfigCard(configNamespaceView(), readonly)
+  assert.strictEqual(findByType(tree, 'select').props.disabled, true, '只读时下拉框不可选')
+  for (const node of collectByType(tree, 'Switch')) {
+    assert.strictEqual(node.props.disabled, true, '只读时开关不可拨')
+  }
+  for (const node of collectByType(tree, 'SettingsValueField')) {
+    assert.strictEqual(node.props.disabled, true, '只读时文本框与它的重置不可用')
+  }
+
+  const saving = freshConfigState()
+  saving.shell = Object.assign({}, saving.shell, { saving: true })
+  for (const node of collectByType(renderConfigCard(configNamespaceView(), saving), 'Switch')) {
+    assert.strictEqual(node.props.disabled, true, '保存中不许再拨开关')
+  }
+})
+
+await check('下拉框选中即暂存编辑，覆盖态给重置', () => {
+  const calls = []
+  const state = freshConfigState()
+  state.accountStrategy = fieldState('active-first', true)
+  state.shell = Object.assign({}, state.shell, { dirty: true })
+  const tree = renderConfigCard(configNamespaceView(), state, {
+    edit: (field, text) => calls.push(['edit', field, text]),
+    resetField: field => calls.push(['resetField', field])
+  })
+  const select = findByType(tree, 'select')
+  assert.strictEqual(select.props.value, 'active-first', '暂存的草稿就是被选中的那一项')
+  select.props.onChange({ target: { value: 'round-robin' } })
+  assert.deepStrictEqual(calls, [['edit', 'accountStrategy', 'round-robin']], '选中只暂存，不直接写 Host')
+  const reset = collectByType(tree, 'button').find(button => button.props.children === '重置')
+  assert.ok(reset, '有覆盖时必须给一个重置')
+  reset.props.onClick()
+  assert.deepStrictEqual(calls[1], ['resetField', 'accountStrategy'])
+})
+
+await check('没有 schema 服务时回落到官方文本框，而不是渲染空下拉框', () => {
+  const tree = renderConfigCard(undefined)
+  assert.strictEqual(findByType(tree, 'select'), null, '没有 schema 就没有选项可列')
+  assert.strictEqual(collectByType(tree, 'SettingsValueField').length, 7, '回落路径仍是官方控件')
+  assert.strictEqual(collectByType(tree, 'Switch').length, 0, '没有 schema 就不冒充布尔开关')
 })
 
 await check('插件页里那份账号卡渲染登录按钮', () => {
@@ -1830,11 +2068,12 @@ await check('配额失败停一个窗口，下一次调用自动换人', async (
   assert.strictEqual(second.email, 'a@b.c', 'a parked account must not be handed out again')
   const parked = pool.list().find(view => view.email === 'd@e.f')
   assert.strictEqual(parked.cooling, true)
-  assert.strictEqual(parked.cooldownSeconds, 300, '停用封顶 5 分钟：provider 说一小时也只排一个窗口')
+  assert.strictEqual(parked.cooldownSeconds, 3600, 'provider 说重置在一小时后，就停一小时')
+  assert.strictEqual(parked.cooldownKind, 'hard', '带重置时间的 429 是硬冷却（事实，不是猜测）')
   assert.match(parked.lastError, /配额/)
 })
 
-await check('重置时间报 92 小时也只停一个窗口，窗口一过就重新排队', async () => {
+await check('重置时间报 92 小时就停 92 小时，期间绝不重试', async () => {
   const pool = makePool()
   const entry = await pool.add(credsOf('a@b.c'))
   pool.reportFailure({
@@ -1843,14 +2082,19 @@ await check('重置时间报 92 小时也只停一个窗口，窗口一过就重
     message: 'q',
     cooldownUntil: clock + 92 * 3600 * 1000
   })
-  assert.strictEqual(pool.list()[0].cooldownSeconds, 300, '任何重置时间都不许把账号停过 5 分钟')
+  assert.strictEqual(pool.list()[0].cooldownSeconds, 92 * 3600, '带重置时间的 429 就是事实，一个字都不改')
+  assert.strictEqual(pool.list()[0].cooldownKind, 'hard')
+  // 负向对照：五分钟后（旧规则下这个点已经放行）仍然不许交出。
   clock += 300_001
-  assert.strictEqual(pool.list()[0].cooling, false, '窗口一过就必须回到队列')
+  assert.strictEqual(pool.list()[0].cooling, true, '硬冷却不许被五分钟这个旧窗口放行')
+  assert.strictEqual(await pool.resolve(), undefined, '唯一账号硬冷却时，调用直接失败而不是拿它重试')
+  // 到点才回来。
+  clock += 92 * 3600 * 1000
   const creds = await pool.resolve()
-  assert.strictEqual(creds.email, 'a@b.c', '重新排队，而不是等到 provider 说的那个时刻')
+  assert.strictEqual(creds.email, 'a@b.c', '到 provider 说的那个时刻才回到队列')
 })
 
-await check('旧版写下的超长冷却在池子启动时被压成一个窗口', async () => {
+await check('旧版写下的冷却被当作硬冷却保留（不猜、不压缩）', async () => {
   removeAuthFile()
   const file = pathJoin(accountsHome, `registry-${poolSeq++}-stale.json`)
   writeAccountRegistry(
@@ -1880,8 +2124,12 @@ await check('旧版写下的超长冷却在池子启动时被压成一个窗口'
   })
   await pool.ready()
   const view = pool.list()[0]
-  assert.strictEqual(view.cooling, true, '纠正不是立即放行：当前这个窗口仍要排完')
-  assert.strictEqual(view.cooldownSeconds, 300, '注册表里的一天长停必须被压成一个窗口：' + view.cooldownSeconds)
+  assert.strictEqual(view.cooling, true)
+  // 旧注册表没有 cooldownKind 这一栏。当年能写进文件的长冷却只可能来自
+  // provider 明说的重置时间（猜的那条路一直封在五分钟），所以按 hard 读 ——
+  // 当成 soft 会把真正耗尽的账号放出去重试。
+  assert.strictEqual(view.cooldownKind, 'hard', '缺字段的旧条目按硬冷却读')
+  assert.strictEqual(view.cooldownSeconds, 24 * 3600, '旧条目里的长冷却不再被压成一个窗口')
 })
 
 await check('手动清除冷却：清掉后下一次调用立刻轮得到它', async () => {
@@ -1908,20 +2156,33 @@ await check('账号恢复可用后冷却自动解除', async () => {
   assert.strictEqual(creds.email, 'a@b.c', 'a cooled-down account must come back')
 })
 
-await check('全部账号都在冷却时仍交出最早恢复的那个（真实错误不被吞）', async () => {
+await check('全部账号硬冷却时不交出任何账号（不拿它重试）', async () => {
   const pool = makePool()
   const a = await pool.add(credsOf('a@b.c'))
   const d = await pool.add(credsOf('d@e.f'))
   pool.reportFailure({ accountId: a.id, kind: 'quota', message: 'q', cooldownUntil: clock + 60_000 })
   pool.reportFailure({ accountId: d.id, kind: 'quota', message: 'q', cooldownUntil: clock + 600_000 })
-  const creds = await pool.resolve()
-  assert.strictEqual(creds.email, 'a@b.c')
-  // 兜底交出不等于配额恢复：冷却必须留着，否则每次调用都会把每个账号重试一遍。
+  // 两个都是「带重置时间的 429」，也就是事实。没有账号可用时就不试 ——
+  // 交出去只会白白再吃一个 429，而 registry 早就知道答案。
+  assert.strictEqual(await pool.resolve(), undefined, '全是硬冷却时必须返回 undefined')
   assert.strictEqual(
     pool.list().find(view => view.email === 'a@b.c').cooling,
     true,
-    'a hand-out to a parked account must not lift the park'
+    '一次都没有被交出去，冷却自然还在'
   )
+})
+
+await check('全硬冷却里夹着软冷却时，只给软的那个一次机会', async () => {
+  const pool = makePool()
+  const hard = await pool.add(credsOf('hard@b.c'))
+  const soft = await pool.add(credsOf('soft@e.f'))
+  pool.reportFailure({ accountId: hard.id, kind: 'quota', message: 'q', cooldownUntil: clock + 3_600_000 })
+  // 不带重置时间 = 猜测的窗口（软冷却），值得花一次请求去验。
+  pool.reportFailure({ accountId: soft.id, kind: 'quota', message: 'q' })
+  assert.strictEqual(pool.list().find(v => v.email === 'soft@e.f').cooldownKind, 'soft')
+  const creds = await pool.resolve()
+  assert.strictEqual(creds.email, 'soft@e.f', '硬冷却绝不给，软冷却可以试')
+  assert.strictEqual(pool.list().find(v => v.email === 'hard@b.c').cooling, true, '硬冷却全程不动')
 })
 
 await check('mergeDuplicates 折叠同一邮箱的条目并保住默认账号', () => {
@@ -2209,26 +2470,48 @@ await check('配额重置时间的解析覆盖常见写法', () => {
   )
 })
 
-await check('配额 429 后同一次调用换下一个账号并成功', async () => {
+await check('带重置时间的 429 是终局：不换账号重试，直接报出 provider 的原因', async () => {
   const pool = makePool()
   const first = await pool.add(credsOf('a@b.c'))
   await pool.add(credsOf('d@e.f'))
   const result = await runAdapter(
+    // 第一个账号吃到「带重置时间」的 429；第二个账号本来健康。
     token => (token.endsWith('access-a@b.c') ? new Response(quotaBody, { status: 429 }) : healthySse()),
     pool
   )
-  assert.strictEqual(result.error, null, `the call must succeed on the second account: ${result.error}`)
-  assert(result.seen.some(token => token.endsWith('access-a@b.c')), 'the exhausted account must be tried first')
-  assert(result.seen.some(token => token.endsWith('access-d@e.f')), 'the second account must take over')
-  assert.strictEqual(finishOf(result.chunks).reason.kind, 'stop')
-  assert.strictEqual(result.failures.length, 1)
+  // provider 量化了自己的恢复时间，这就是这次调用的最终答案 —— 再往下走
+  // 只会把同样的 429 重学一遍。用户拿到的是真实配额信息，不是「未登录」。
+  assert(result.error !== null, '带重置时间的 429 不许被下一个账号悄悄盖过去')
+  assert.strictEqual(result.error.code, 'QUOTA_EXCEEDED')
+  assert.match(result.error.message, /配额已用尽/)
+  assert(result.seen.every(token => token.endsWith('access-a@b.c')), '不该去碰第二个账号：' + result.seen.join(','))
+  assert.strictEqual(result.failures.length, 1, '失败只记一次')
   assert.strictEqual(result.failures[0].kind, 'quota')
   assert.strictEqual(result.failures[0].accountId, first.id)
   assert(
     result.failures[0].cooldownUntil > Date.now(),
     '429 里的 "Resets in 1h0m0s" 必须被解析成冷却时间'
   )
-  assert.strictEqual(pool.list().find(view => view.email === 'a@b.c').cooling, true)
+  const parked = pool.list().find(view => view.email === 'a@b.c')
+  assert.strictEqual(parked.cooling, true)
+  assert.strictEqual(parked.cooldownKind, 'hard', '带重置时间 = 硬冷却')
+})
+
+await check('不带重置时间的 429 仍是软冷却：换下一个账号继续试', async () => {
+  const pool = makePool()
+  await pool.add(credsOf('a@b.c'))
+  await pool.add(credsOf('d@e.f'))
+  const result = await runAdapter(
+    // 429 但正文没说什么时候重置 —— 猜测的窗口，值得换人试。
+    token => (token.endsWith('access-a@b.c') ? new Response('{"error":{"message":"rate limited"}}', { status: 429 }) : healthySse()),
+    pool
+  )
+  assert.strictEqual(result.error, null, `软冷却必须还能换账号成功：${result.error}`)
+  assert(result.seen.some(token => token.endsWith('access-d@e.f')), '第二个账号必须接手')
+  assert.strictEqual(finishOf(result.chunks).reason.kind, 'stop')
+  assert.strictEqual(result.failures[0].kind, 'quota')
+  assert.strictEqual(result.failures[0].cooldownUntil, undefined, '没说重置时间就不能编一个')
+  assert.strictEqual(pool.list().find(view => view.email === 'a@b.c').cooldownKind, 'soft')
 })
 
 await check('负控：传输类失败不换账号（换也没用）', async () => {
@@ -2245,15 +2528,35 @@ await check('负控：传输类失败不换账号（换也没用）', async () =
   assert.strictEqual(result.failures[0].kind, 'other')
 })
 
-await check('全部账号都配额耗尽时抛出的是真实的配额错误', async () => {
+await check('带重置时间的配额耗尽：第一次就报真实配额错误，且只停那一个账号', async () => {
   const pool = makePool()
-  await pool.add(credsOf('a@b.c'))
+  const first = await pool.add(credsOf('a@b.c'))
   await pool.add(credsOf('d@e.f'))
   const result = await runAdapter(() => new Response(quotaBody, { status: 429 }), pool)
   assert(result.error, 'the call must fail')
   assert.match(result.error.message, /配额已用尽/)
-  assert.strictEqual(result.failures.length, 2, 'both accounts must be reported')
+  // provider 量化了恢复时间 ⇒ 这次调用的最终答案。第二个账号根本没被请求，
+  // 所以它不该被记一笔失败，也不该被停 —— 下次调用还得靠它。
+  assert.strictEqual(result.failures.length, 1, '只有真正被请求过的账号才记失败')
+  assert.strictEqual(result.failures[0].accountId, first.id)
+  const views = pool.list()
+  assert.strictEqual(views.find(v => v.email === 'a@b.c').cooling, true, '吃到 429 的账号停用')
+  assert.strictEqual(views.find(v => v.email === 'd@e.f').cooling, false, '没碰过的账号不该被牵连')
+})
+
+await check('全部账号都软冷却时，两个都被试过并各自记一笔', async () => {
+  const pool = makePool()
+  await pool.add(credsOf('a@b.c'))
+  await pool.add(credsOf('d@e.f'))
+  // 不带重置时间的 429 = 软冷却，值得逐个试；试完两个都不行才报错。
+  const result = await runAdapter(
+    () => new Response('{"error":{"message":"rate limited"}}', { status: 429 }),
+    pool
+  )
+  assert(result.error, 'the call must fail')
+  assert.strictEqual(result.failures.length, 2, '软冷却会走遍整个池子')
   assert.strictEqual(pool.list().filter(view => view.cooling).length, 2)
+  assert(pool.list().every(view => view.cooldownKind === 'soft'), '这两笔都是猜测的窗口')
 })
 
 await check('鉴权失败（401）同样换账号', async () => {
@@ -2298,27 +2601,31 @@ await check('真实配额报文（Resets in + RESOURCE_EXHAUSTED + reason）仍�
   assert.strictEqual(pool.list()[0].cooling, true, '真配额用尽就该停用这个账号')
 })
 
-await check('429 但报文不是配额：编成 RATE_LIMIT 交给 DSH 重试，账号不停用', async () => {
+await check('429 但报文不是配额：code 保持 RATE_LIMIT（保住 DSH 重试），同时记成软冷却', async () => {
   const pool = makePool()
   await pool.add(credsOf('a@b.c'))
   // 报文里没有任何配额字样：这是被限流/网关抖动，等一个「重置时间」没有意义。
   const transient = '{"error":{"code":429,"message":"Rate Limit Exceeded"}}'
   const result = await runAdapter(() => new Response(transient, { status: 429 }), pool)
   assert(result.error, '全部端点都失败后仍然要把错误抛出来')
+  // code 与 kind 回答的是两个不同的问题，所以这里两条必须同时成立：
+  //   code —— DSH 的重试策略认得 RATE_LIMIT（不认得 QUOTA_EXCEEDED），
+  //           编成 QUOTA_EXCEEDED 就等于永久退出自动重试；
+  //   kind —— 对账号池来说这仍然是「这个号被限流了」，该软冷却、该换人。
   assert.strictEqual(
     result.error.code,
     'RATE_LIMIT',
     'dsh-llm-retry 的 retryableCodes 默认含 RATE_LIMIT；编成 QUOTA_EXCEEDED 就永远不会自动重试'
   )
-  assert.strictEqual(result.error.retryAtMs, undefined, '非配额 429 不能凭空编一个冷却时间')
+  assert.strictEqual(result.error.quotaScoped, true, '但它仍然是账号级的限流，池子该看到这件事')
+  assert.strictEqual(result.error.retryAtMs, undefined, '没说重置时间就不能凭空编一个')
   assert.doesNotMatch(result.error.message, /配额已用尽/, '文案不能把限流说成配额用尽')
+  const view = pool.list()[0]
+  assert.strictEqual(view.cooling, true, '限流也是账号级的，要软冷却（可以再试，但不是首选）')
+  assert.strictEqual(view.cooldownKind, 'soft', '猜测的窗口 —— 不是 provider 量化的事实')
   assert(
-    pool.list().every(view => view.cooling === false),
-    '报文没说配额用尽就不许停用账号，否则有余额的账号会被静默跳过'
-  )
-  assert(
-    result.failures.every(failure => failure.kind === 'other'),
-    `非配额 429 只能记成 other：${JSON.stringify(result.failures)}`
+    result.failures.every(failure => failure.kind === 'quota'),
+    `账号级 429 记成 quota：${JSON.stringify(result.failures)}`
   )
 })
 

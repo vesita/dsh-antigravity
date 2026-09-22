@@ -12,11 +12,14 @@
      * The official staged-form primitives. This page reuses them rather than
      * inventing a save path: `SettingsFormModel` stages a card's edits over one
      * configuration namespace and writes them on save, `SettingsForm` draws the
-     * save bar, `SettingsValueField` draws one labelled control.
+     * save bar, `SettingsValueField` draws one labelled text control, and
+     * `Switch` is the official toggle for a two-state field (the field helpers
+     * ship none, so a switch has to be mounted by the card itself).
      */
     const SettingsForm = primitives.SettingsForm
     const SettingsValueField = primitives.SettingsValueField
     const SettingsFormModel = primitives.SettingsFormModel
+    const Switch = primitives.Switch
     const settingsNumberField = primitives.settingsNumberField
     const settingsTextField = primitives.settingsTextField
     const h = React.createElement
@@ -106,6 +109,9 @@
       strategyRoundRobin: string
       strategyActiveFirst: string
       strategyPrefix: string
+      overridden: string
+      reset: string
+      invalidValue: string
     }
 
     const ROUTE = '/dsh-antigravity/auth'
@@ -138,7 +144,10 @@
           account: 'Google 账号',
           strategyRoundRobin: '轮询使用',
           strategyActiveFirst: '优先默认账号',
-          strategyPrefix: '策略'
+          strategyPrefix: '策略',
+          overridden: '已覆盖',
+          reset: '重置',
+          invalidValue: 'Host 不接受这个值'
         }
       : {
           signedIn: 'Signed in',
@@ -164,7 +173,10 @@
           account: 'Google account',
           strategyRoundRobin: 'Round-robin',
           strategyActiveFirst: 'Active first',
-          strategyPrefix: 'Strategy'
+          strategyPrefix: 'Strategy',
+          overridden: 'Overridden',
+          reset: 'Reset',
+          invalidValue: 'The Host does not accept this value'
         }
 
     async function call(path: string, init?: RequestInit): Promise<any> {
@@ -1248,17 +1260,99 @@
       if (scope === undefined || scope === null) return
 
       /**
-       * A boolean rendered as a two-state text field.
+       * This namespace's row in the shared settings describe mirror — the same
+       * source `configForms.get` derives the form's values from, so the schema a
+       * read below walks can never come from a different document.
+       */
+      function describeNamespace(): any {
+        if (forms === undefined || typeof forms.describe !== 'function') return undefined
+        const view = forms.describe().getSnapshot().view
+        if (view === undefined || view === null) return undefined
+        return (view.namespaces || []).find((candidate: any) => candidate.ns === CONFIG_NS)
+      }
+
+      /**
+       * This namespace's live schema node for one Config key.
+       *
+       * Which control a field gets is decided by what the Host `Config` declares,
+       * never by a list retyped here: the same read feeds the strategy dropdown
+       * and the boolean toggle, so a value added on the Host side — or a field
+       * turned into a union — reaches the card without a client change.
+       *
+       * @param field - the Config key to read.
+       * @returns the live schemastery node, or undefined when the deployment
+       *   serves no schema for this namespace, or the key is absent from it.
+       */
+      function fieldNode(field: string): any {
+        // `settingsSchema` ships with `configForms` (both are provided by
+        // ui-settings), but a deployment may serve one without the other: no
+        // service means no node, which costs the specialised control and nothing
+        // else — every field still renders as the official text field.
+        const schema = typeof ctx.get === 'function' ? ctx.get('settingsSchema') : undefined
+        if (schema === undefined || schema === null) return undefined
+        try {
+          const view = describeNamespace()
+          if (view === undefined) return undefined
+          return schema.nodeAtPath(schema.rehydrate(view.schema), [field])
+        } catch {
+          return undefined
+        }
+      }
+
+      /**
+       * The values a union-typed field declares, in declaration order.
+       *
+       * A dropdown must offer exactly the values the Host accepts, so they are
+       * read back from the schema: the `z.union([...])` in the Host `Config` stays
+       * the one declaration, and a value added there appears in the control with
+       * no client change.
+       *
+       * @param field - the Config key to read the choice set of.
+       * @returns the union's string values; empty when the key is not a union.
+       */
+      function fieldChoices(field: string): string[] {
+        const node = fieldNode(field)
+        if (node === undefined || node.type !== 'union' || !Array.isArray(node.list)) return []
+        return node.list.map((entry: any) => entry.value).filter((value: any) => typeof value === 'string')
+      }
+
+      /** Whether the Host `Config` declares this key as a two-state boolean. */
+      function fieldIsBoolean(field: string): boolean {
+        const node = fieldNode(field)
+        return node !== undefined && node.type === 'boolean'
+      }
+
+      /**
+       * A boolean field, staged as the two-state text "on"/"off".
        *
        * The official primitives ship `settingsNumberField` and
-       * `settingsTextField` but no boolean helper, and `SettingsValueField`
-       * draws a text input. So a switch travels as the text "on"/"off" and is
-       * translated back in `parse`; what reaches the Host is a real boolean.
+       * `settingsTextField` but no boolean spec helper, so the value travels as
+       * text and is translated back in `parse`; what reaches the Host is a real
+       * boolean. Keeping one text protocol is what lets the control change to the
+       * official `Switch` (see {@link switchControl}) without touching the write.
        */
       const booleanField = (field: string) => ({
         field,
         format: (value: any) => (value === true ? 'on' : 'off'),
         parse: (text: string) => ({ kind: 'set', value: String(text).trim() === 'on' })
+      })
+      /**
+       * A field whose finite choices this namespace's own schema declares.
+       *
+       * A draft the schema refuses blocks the save (`undefined`) instead of being
+       * silently rewritten; the dropdown cannot produce one, but the text
+       * fallback for a deployment that serves no schema can.
+       */
+      const schemaChoiceField = (field: string) => ({
+        field,
+        format: (value: any) => (typeof value === 'string' ? value : ''),
+        parse: (text: string) => {
+          const trimmed = String(text).trim()
+          if (trimmed === '') return { kind: 'clear' }
+          const allowed = fieldChoices(field)
+          if (allowed.length > 0 && allowed.indexOf(trimmed) < 0) return undefined
+          return { kind: 'set', value: trimmed }
+        }
       })
       /** A two-choice field over an enum, also travelling as text. */
       const choiceField = (field: string, allowed: string[], fallback: string) => ({
@@ -1272,7 +1366,7 @@
       })
 
       const formModel = new SettingsFormModel(scope, [
-        choiceField('accountStrategy', ['round-robin', 'active-first'], 'round-robin'),
+        schemaChoiceField('accountStrategy'),
         choiceField('reasoningEffort', REASONING_EFFORT_IDS, REASONING_EFFORT_IDS[0]),
         booleanField('proxyEnabled'),
         settingsTextField('proxyHost'),
@@ -1304,19 +1398,211 @@
       ctx.effect(() => () => formStore.dispose())
 
       /**
-       * One labelled control. The field's staged text and its override/reset
-       * state both come from the store; the actions come from the slot's inject.
+       * The official settings-field chrome, as inline styles.
+       *
+       * The card ships no CSS build, so the tokens `settings-form/fields.module.css`
+       * uses are applied here directly; only the control itself is not official.
        */
-      function configField(props: any, id: string, node: any, label: string, hint: string) {
+      const fieldStyles = {
+        field: { display: 'flex', flexDirection: 'column', gap: '6px', padding: '12px 0' },
+        head: { display: 'flex', alignItems: 'center', gap: '8px' },
+        label: {
+          flex: '1',
+          minWidth: '0',
+          fontSize: '13px',
+          fontWeight: '500',
+          lineHeight: '1.5',
+          color: 'var(--dsw-alias-label-primary)'
+        },
+        badges: { display: 'inline-flex', alignItems: 'center', gap: '8px' },
+        badge: { fontSize: '12px', lineHeight: '1.5', color: 'var(--dsw-alias-label-secondary)' },
+        reset: {
+          border: 'none',
+          background: 'none',
+          padding: '0',
+          font: 'inherit',
+          fontSize: '12px',
+          lineHeight: '1.5',
+          color: 'var(--dsw-alias-label-secondary)',
+          cursor: 'pointer'
+        },
+        select: {
+          height: '34px',
+          padding: '0 12px',
+          border: '0.5px solid var(--dsw-alias-border-l4)',
+          borderRadius: '8px',
+          background: 'var(--dsw-alias-bg-layer-3)',
+          font: 'inherit',
+          fontSize: '13px',
+          lineHeight: '1.5',
+          color: 'var(--dsw-alias-label-primary)'
+        },
+        hint: { margin: '0', fontSize: '12px', lineHeight: '1.5', color: 'var(--dsw-alias-label-tertiary)' },
+        invalid: { margin: '0', fontSize: '12px', lineHeight: '1.5', color: 'var(--dsw-alias-state-error-primary)' },
+        // A hairline between two fields of the same group, the 0.5px rule the
+        // official `fields.module.css` draws between sibling fields.
+        hr: { borderTop: '0.5px solid var(--dsw-alias-border-l2)' }
+      }
+
+      /** The hairline that separates two fields inside one group. */
+      function fieldHr(key: string) {
+        return h('div', { key: key, style: fieldStyles.hr })
+      }
+
+      /**
+       * The override badge with its reset, or nothing when the field carries no
+       * user layer. Shared by every specialised control so the three of them
+       * cannot disagree about what "overridden" looks like.
+       */
+      function overrideBadges(node: any, onReset: any) {
+        if (!node.overridden) return null
+        return h(
+          'span',
+          { key: 'badges', style: fieldStyles.badges },
+          h('span', { key: 'badge', style: fieldStyles.badge }, copy.overridden),
+          h('button', { key: 'reset', type: 'button', style: fieldStyles.reset, onClick: onReset }, copy.reset)
+        )
+      }
+
+      /**
+       * One finite-choice field as a dropdown.
+       *
+       * A native `<select>`, the control the DSH settings pages use for the same
+       * case; the label, the override badge with its reset, and the hint mirror
+       * the official `SettingsValueField` chrome, because only the input differs.
+       * The options are the choices the namespace schema declares — never a list
+       * retyped here — and the selected option is the staged draft, so picking one
+       * stages an edit exactly like typing did and the form's save stays the only
+       * write.
+       */
+      function choiceControl(
+        id: string,
+        node: any,
+        label: string,
+        hint: string,
+        choices: string[],
+        onEdit: any,
+        onReset: any,
+        locked: boolean
+      ) {
+        // A stored value the schema no longer declares still has to be visible, so
+        // it becomes its own option instead of leaving the control blank.
+        const options = node.text !== '' && choices.indexOf(node.text) < 0 ? [node.text].concat(choices) : choices
+        return h(
+          'div',
+          { key: id, style: fieldStyles.field },
+          h(
+            'div',
+            { key: 'head', style: fieldStyles.head },
+            h('label', { key: 'label', htmlFor: id, style: fieldStyles.label }, label),
+            overrideBadges(node, onReset)
+          ),
+          h(
+            'select',
+            {
+              key: 'select',
+              id: id,
+              style: fieldStyles.select,
+              value: node.text,
+              disabled: locked,
+              'aria-invalid': node.invalid ? true : undefined,
+              onChange: function (event: any) {
+                onEdit(event.target.value)
+              }
+            },
+            options.map((value: string) => h('option', { key: value, value: value }, value))
+          ),
+          h(
+            'p',
+            { key: 'hint', style: node.invalid ? fieldStyles.invalid : fieldStyles.hint },
+            node.invalid ? copy.invalidValue : hint
+          )
+        )
+      }
+
+      /**
+       * One boolean field as the official toggle.
+       *
+       * What the form stages is unchanged — the field's spec still travels as the
+       * text `on`/`off` — so only the control differs, and the Host still receives
+       * a real boolean. The label rides the row as plain text rather than a
+       * `<label for>`, because `Switch` owns its accessible name through `label`;
+       * that is also how the official settings pages mount it.
+       */
+      function switchControl(
+        id: string,
+        node: any,
+        label: string,
+        hint: string,
+        onEdit: any,
+        onReset: any,
+        locked: boolean
+      ) {
+        return h(
+          'div',
+          { key: id, style: fieldStyles.field },
+          h(
+            'div',
+            { key: 'head', style: fieldStyles.head },
+            h('span', { key: 'label', style: fieldStyles.label }, label),
+            overrideBadges(node, onReset),
+            h(Switch, {
+              key: 'switch',
+              checked: node.text === 'on',
+              label: label,
+              disabled: locked,
+              onChange: function (next: boolean) {
+                onEdit(next ? 'on' : 'off')
+              }
+            })
+          ),
+          h(
+            'p',
+            { key: 'hint', style: node.invalid ? fieldStyles.invalid : fieldStyles.hint },
+            node.invalid ? copy.invalidValue : hint
+          )
+        )
+      }
+
+      /**
+       * One labelled control, chosen by what the field *is*.
+       *
+       * A field whose schema declares a union renders as a dropdown, a boolean as
+       * the official toggle, and everything else as the official text field. All
+       * three read the same store and stage through the same actions, so the save
+       * path is identical whichever one draws the field.
+       *
+       * @param props - the slot-injected actions.
+       * @param state - the card's projection: one node per field, plus `shell`.
+       * @param id - the Config key, which is also the control's id.
+       * @param label - visible label.
+       * @param hint - one-line explanation under the control.
+       * @param choices - the field's declared values, when it has any.
+       */
+      function configField(props: any, state: any, id: string, label: string, hint: string, choices?: string[]) {
+        const node = state[id]
+        const shell = state.shell || {}
+        // A control is inert while the document refuses writes or a save is in
+        // flight — the rule the official settings pages apply to their fields.
+        const locked = shell.writable === false || shell.saving === true
+        const onEdit = function (value: string) {
+          props.edit(id, value)
+        }
+        const onReset = function () {
+          props.resetField(id)
+        }
+        if (choices !== undefined && choices.length > 0) {
+          return choiceControl(id, node, label, hint, choices, onEdit, onReset, locked)
+        }
+        if (fieldIsBoolean(id)) {
+          return switchControl(id, node, label, hint, onEdit, onReset, locked)
+        }
         return h(
           SettingsValueField,
           Object.assign({ key: id, id: id, label: label, hint: hint }, node, {
-            onEdit: function (text: string) {
-              props.edit(id, text)
-            },
-            onReset: function () {
-              props.resetField(id)
-            }
+            disabled: locked,
+            onEdit: onEdit,
+            onReset: onReset
           })
         )
       }
@@ -1364,20 +1650,45 @@
               onDiscard: props.discard
             },
             [
-              configField(props, 'accountStrategy', state.accountStrategy, '账号池策略',
-                'round-robin 轮流使用每个账号；active-first 先用默认账号，配额耗尽再换下一个。'),
-              configField(props, 'reasoningEffort', state.reasoningEffort, '思考强度',
-                '请求时使用的 reasoning effort；留空则用模型自己的默认档。'),
-              configField(props, 'proxyEnabled', state.proxyEnabled, '兼容代理',
-                'on 时在本机开一个 OpenAI 兼容的转发端口，供只认 OpenAI 协议的客户端使用。'),
-              configField(props, 'proxyHost', state.proxyHost, '代理监听地址',
-                '兼容代理绑定的网卡地址，默认 127.0.0.1（仅本机可访问）。'),
-              configField(props, 'proxyPort', state.proxyPort, '代理端口',
-                '兼容代理监听的端口，默认 8045。'),
-              configField(props, 'usageEnabled', state.usageEnabled, '用量统计',
-                'on 时把每次调用的用量记进本地数据库（只在本机，不外发）。'),
-              configField(props, 'usageRetentionDays', state.usageRetentionDays, '用量保留天数',
-                '超过这个天数的调用记录会被清理；0 表示全部保留。')
+              // Three groups by feature, in the order a user meets them: which
+              // account and how hard it thinks, then the optional proxy, then
+              // usage bookkeeping. Each switch sits with the fields it governs,
+              // so "what does this knob affect" is answered by adjacency rather
+              // than by reading three hints.
+              h(
+                'section',
+                { key: 'dispatch', style: cardStyles.section },
+                h('div', { key: 'title', style: cardStyles.heading }, '账号与请求'),
+                configField(props, state, 'accountStrategy', '账号池策略',
+                  'round-robin 轮流使用每个账号；active-first 先用默认账号，配额耗尽再换下一个。',
+                  fieldChoices('accountStrategy')),
+                fieldHr('hr-dispatch'),
+                configField(props, state, 'reasoningEffort', '思考强度',
+                  '请求时使用的 reasoning effort；留空则用模型自己的默认档。')
+              ),
+              h(
+                'section',
+                { key: 'proxy', style: cardStyles.section },
+                h('div', { key: 'title', style: cardStyles.heading }, '兼容代理'),
+                configField(props, state, 'proxyEnabled', '启用兼容代理',
+                  '打开时在本机开一个 OpenAI 兼容的转发端口，供只认 OpenAI 协议的客户端使用。'),
+                fieldHr('hr-proxy-host'),
+                configField(props, state, 'proxyHost', '代理监听地址',
+                  '兼容代理绑定的网卡地址，默认 127.0.0.1（仅本机可访问）。'),
+                fieldHr('hr-proxy-port'),
+                configField(props, state, 'proxyPort', '代理端口',
+                  '兼容代理监听的端口，默认 8045。')
+              ),
+              h(
+                'section',
+                { key: 'usage', style: cardStyles.section },
+                h('div', { key: 'title', style: cardStyles.heading }, '用量统计'),
+                configField(props, state, 'usageEnabled', '启用用量统计',
+                  '打开时把每次调用的用量记进本地数据库（只在本机，不外发）。'),
+                fieldHr('hr-usage-days'),
+                configField(props, state, 'usageRetentionDays', '用量保留天数',
+                  '超过这个天数的调用记录会被清理；0 表示全部保留。')
+              )
             ]
           )
         )

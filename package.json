@@ -1,6 +1,6 @@
 {
   "name": "dsh-antigravity",
-  "version": "0.4.12",
+  "version": "0.4.16",
   "description": "DSH 插件：Google Antigravity 模型提供商适配器 —— 原生模型接入，提供多账号管理与用量统计面板",
   "type": "module",
   "main": "lib/index.js",

@@ -45,15 +45,14 @@ export const ACCOUNT_REGISTRY_VERSION = 1
 export const DEFAULT_QUOTA_COOLDOWN_MS = 5 * 60 * 1000
 
 /**
- * Ceiling on any cooldown, whatever reset time the body claims.
+ * Ceiling on a cooldown that the provider did **not** explain.
  *
- * The pool is a queue, not a write-off: an account that reports a reset still 92
- * hours away is benched for one short window and then re-tested, so a quota that
- * comes back earlier than advertised rejoins the rotation instead of being
- * missed for a day. The price is one request per window while it really is
- * exhausted — cheaper than not noticing a recovery.
+ * Only the guess is bounded. A body that names its reset time is a fact, and it
+ * is parked for exactly that long however far away it is — see
+ * {@link MAX_GUESSED_QUOTA_COOLDOWN_MS} for why the two cases must not share a
+ * ceiling.
  */
-export const MAX_QUOTA_COOLDOWN_MS = 5 * 60 * 1000
+export const MAX_GUESSED_QUOTA_COOLDOWN_MS = 5 * 60 * 1000
 
 /**
  * How long an account is skipped after a credential failure (a refresh that came
@@ -89,6 +88,15 @@ export interface AccountEntry {
    * go.
    */
   cooldownUntil?: number
+  /**
+   * How firm {@link AccountEntry.cooldownUntil} is.
+   *
+   * A park is a *fact* when the provider named its reset time, and a *guess*
+   * when it did not (or when a token refresh failed). Only the guessed kind may
+   * be tried before it expires: it costs one request to find out, whereas
+   * re-testing a quota the provider quantified just spends another 429.
+   */
+  cooldownKind?: 'hard' | 'soft'
   /** Last failure this account produced, for the settings card. */
   lastError?: string
   /** Failure class behind {@link AccountEntry.lastError}. */
@@ -120,6 +128,8 @@ export interface AccountView {
   cooldownUntil: number | null
   cooldownSeconds: number | null
   cooling: boolean
+  /** `'hard'` when the provider quantified the reset, `'soft'` when it is a guess. */
+  cooldownKind: 'hard' | 'soft' | null
   active: boolean
   source: string | null
   lastError: string | null
@@ -196,6 +206,7 @@ export function readAccountRegistry(file: string = accountsFilePath()): AccountR
       addedAt: typeof raw.addedAt === 'number' ? raw.addedAt : 0,
       ...(typeof raw.lastUsedAt === 'number' ? { lastUsedAt: raw.lastUsedAt } : {}),
       ...(typeof raw.cooldownUntil === 'number' ? { cooldownUntil: raw.cooldownUntil } : {}),
+      ...(raw.cooldownKind === 'hard' || raw.cooldownKind === 'soft' ? { cooldownKind: raw.cooldownKind } : {}),
       ...(typeof raw.lastError === 'string' && raw.lastError !== '' ? { lastError: raw.lastError } : {}),
       ...(raw.lastErrorKind === 'quota' || raw.lastErrorKind === 'auth' || raw.lastErrorKind === 'other'
         ? { lastErrorKind: raw.lastErrorKind }
@@ -291,6 +302,7 @@ export function upsertAccount(
   }
   if (creds.projectId) target.projectId = creds.projectId
   target.cooldownUntil = undefined
+  target.cooldownKind = undefined
   target.lastError = undefined
   target.lastErrorKind = undefined
   registry.updatedAt = now
@@ -344,7 +356,15 @@ export function mergeDuplicates(registry: AccountRegistry, now: number = Date.no
     survivor.projectId = survivor.projectId ?? entry.projectId
     survivor.addedAt = Math.min(survivor.addedAt, entry.addedAt)
     survivor.lastUsedAt = Math.max(survivor.lastUsedAt ?? 0, entry.lastUsedAt ?? 0) || undefined
-    survivor.cooldownUntil = Math.max(survivor.cooldownUntil ?? 0, entry.cooldownUntil ?? 0) || undefined
+    // Keep the later park, and keep the *firmer* grade attached to it: a merge
+    // must not quietly downgrade a provider-quantified park into a retryable one.
+    const survivorUntil = survivor.cooldownUntil ?? 0
+    const entryUntil = entry.cooldownUntil ?? 0
+    survivor.cooldownUntil = Math.max(survivorUntil, entryUntil) || undefined
+    if (survivor.cooldownUntil === undefined) survivor.cooldownKind = undefined
+    else if (survivorUntil === entryUntil) {
+      survivor.cooldownKind = survivor.cooldownKind === 'hard' || entry.cooldownKind === 'hard' ? 'hard' : 'soft'
+    } else survivor.cooldownKind = (survivorUntil > entryUntil ? survivor.cooldownKind : entry.cooldownKind) ?? 'hard'
     if (survivor.lastError === undefined) {
       survivor.lastError = entry.lastError
       survivor.lastErrorKind = entry.lastErrorKind
@@ -425,6 +445,7 @@ export function viewOf(entry: AccountEntry, registry: AccountRegistry, now: numb
     cooldownUntil: typeof entry.cooldownUntil === 'number' ? entry.cooldownUntil : null,
     cooldownSeconds: cooling ? Math.max(0, Math.round((entry.cooldownUntil! - now) / 1000)) : null,
     cooling,
+    cooldownKind: cooling ? (entry.cooldownKind === 'soft' ? 'soft' : 'hard') : null,
     active: registry.activeId === entry.id,
     source: entry.creds.source ?? null,
     lastError: entry.lastError ?? null
@@ -556,21 +577,35 @@ export class AccountPool {
   }
 
   /**
-   * Rewrite a cooldown that outlasts the current ceiling.
+   * Rewrite a *guessed* cooldown that outlasts the current ceiling.
    *
-   * The registry is durable and shared with the CLI, so a park written under an
-   * earlier, longer rule would keep an account out of the queue for a day after
-   * that rule changed. Repairing it on the read path — not only where a park is
-   * written — is what makes "never parked longer than
-   * {@link MAX_QUOTA_COOLDOWN_MS}" true of registries that already exist.
+   * The registry is durable and shared with the CLI, so a guess written under an
+   * earlier, longer rule would keep an account out of the queue long after that
+   * rule changed. Repairing it on the read path — not only where a park is
+   * written — is what makes "a guess is never longer than
+   * {@link MAX_GUESSED_QUOTA_COOLDOWN_MS}" true of registries that already exist.
+   *
+   * A `'hard'` park is left alone at any length: it is the provider's own
+   * statement, and shortening it would spend requests re-learning it. Entries
+   * from before this distinction existed carry no `cooldownKind` and are read as
+   * `'hard'` (see `#cooldownKind`), so they are left alone too.
    */
   #shortenStaleCooldowns(): void {
     const now = this.#now()
     const registry = this.#load()
     let changed = false
     for (const entry of registry.accounts) {
-      if (typeof entry.cooldownUntil === 'number' && entry.cooldownUntil > now + MAX_QUOTA_COOLDOWN_MS) {
-        entry.cooldownUntil = now + MAX_QUOTA_COOLDOWN_MS
+      // Only an *explicitly* soft park is repaired. A missing `cooldownKind`
+      // means the entry predates this distinction, and the only parks that could
+      // grow that long back then were provider-stated ones (the guessed path was
+      // always capped at five minutes) — so it is read as `'hard'`, exactly as
+      // `#cooldownKind` reads it. The two must agree: compressing here what the
+      // reader calls hard would re-introduce the retry storm this change exists
+      // to remove.
+      if (entry.cooldownKind !== 'soft') continue
+      if (typeof entry.cooldownUntil === 'number' && entry.cooldownUntil > now + MAX_GUESSED_QUOTA_COOLDOWN_MS) {
+        entry.cooldownUntil = now + MAX_GUESSED_QUOTA_COOLDOWN_MS
+        entry.cooldownKind = 'soft'
         changed = true
       }
     }
@@ -662,22 +697,33 @@ export class AccountPool {
     const available = candidates.filter(candidate => exclude === undefined || !exclude.has(candidate.id))
     if (available.length === 0) return undefined
 
+    // Three grades, tried in this order:
+    //   ready      — not parked at all;
+    //   soft       — parked on a *guess* (an unexplained 429, a failed refresh).
+    //                Worth one request: the guess may simply be wrong;
+    //   hard       — parked on a reset time the provider quantified. Retrying
+    //                before that moment is a wasted 429 by construction, so a
+    //                hard-parked account is never handed out.
     const ready = available.filter(candidate => !this.#cooling(candidate, now))
-    // Every candidate parked: ask the one that recovers first, so the provider's
-    // own quota message reaches the caller instead of "no credentials".
-    const order =
-      ready.length > 0
-        ? this.#order(ready)
-        : available.slice().sort((a, b) => this.#cooldownEnd(a, now) - this.#cooldownEnd(b, now))
+    const soft = available.filter(candidate => this.#cooling(candidate, now) && this.#cooldownKind(candidate) === 'soft')
+    // Nothing can serve this call. Returning the soonest-recovering account here
+    // used to be a deliberate fallback — "let the provider's own quota message
+    // reach the caller" — but it makes every call during an exhaustion pay a
+    // round trip to re-learn a fact the registry already holds. The caller gets
+    // `undefined`, which is the truth: no account is available right now.
+    if (ready.length === 0 && soft.length === 0) return undefined
+
+    const order = ready.length > 0 ? [...this.#order(ready), ...soft] : soft.slice().sort((a, b) => this.#cooldownEnd(a, now) - this.#cooldownEnd(b, now))
 
     let lastFailure: unknown = null
     for (const candidate of order) {
       try {
         const creds = await this.#usable(candidate)
         if (creds !== undefined) {
-          // Handing an account out is not evidence its quota recovered, so a
-          // candidate that was parked a moment ago keeps its park — see
-          // {@link AccountPool.markUsed}.
+          // A soft park is deliberately retryable, and this hand-out *is* the
+          // retry: it only counts as evidence once the call behind it succeeds,
+          // which `reportFailure` will contradict if it does not. A hard park is
+          // never handed out at all, so `recovered` is simply "was not parked".
           this.markUsed(creds, { recovered: !this.#cooling(candidate, now) })
           return creds
         }
@@ -779,6 +825,20 @@ export class AccountPool {
     return typeof entry?.cooldownUntil === 'number' ? entry.cooldownUntil : now
   }
 
+  /**
+   * Whether a park came from a quantified reset time or from a guess.
+   *
+   * Absent means `'hard'`: registries written before this distinction existed
+   * only ever parked on a provider-stated reset (the guessed case was capped at
+   * five minutes), so treating the missing field as anything else would hand out
+   * accounts that are genuinely exhausted.
+   */
+  #cooldownKind(candidate: Candidate): 'hard' | 'soft' {
+    if (candidate.transient) return 'soft'
+    const entry = this.#load().accounts.find(a => a.id === candidate.id)
+    return entry?.cooldownKind === 'soft' ? 'soft' : 'hard'
+  }
+
   /** Refresh when needed, one attempt per account at a time. */
   async #usable(candidate: Candidate): Promise<AntigravityCredentials | undefined> {
     const creds = candidate.creds
@@ -866,6 +926,7 @@ export class AccountPool {
     entry.lastUsedAt = now
     if (recovered) {
       entry.cooldownUntil = undefined
+      entry.cooldownKind = undefined
       entry.lastError = undefined
       entry.lastErrorKind = undefined
     }
@@ -875,10 +936,19 @@ export class AccountPool {
   }
 
   /**
-   * Record an account-scoped failure. A quota failure parks the account for one
-   * short window — its reset time, capped — which is what makes the next call go
-   * to a different account, and what makes the pool re-test it in this window
-   * rather than at a reset time it may never reach.
+   * Record an account-scoped failure.
+   *
+   * A quota failure parks the account, which is what makes the next call go to a
+   * different account. Two grades are kept apart on purpose:
+   *
+   * - **The provider named a reset time** (`Resets in 3h12m`) — that is a fact,
+   *   not a backoff, so the account is parked for exactly that long however far
+   *   away it is, and no request is spent re-testing it before then. A 429 that
+   *   quantifies its own recovery is a higher grade of rejection than one that
+   *   does not, and treating the two alike is what made an account report "63h
+   *   from now" and still get retried five minutes later.
+   * - **The provider said nothing** — the wait is a guess, so it is capped at
+   *   {@link MAX_GUESSED_QUOTA_COOLDOWN_MS} and re-tested in that window.
    */
   reportFailure(info: AccountFailureInfo): void {
     if (info.accountId === undefined || info.accountId === ENV_ACCOUNT_ID) return
@@ -893,11 +963,13 @@ export class AccountPool {
       // is saying the quota is back; parking it anyway would take a healthy
       // account out of the rotation for the conservative default. Silence about
       // the reset time is the case that default exists for.
-      const until =
-        typeof info.cooldownUntil === 'number'
-          ? info.cooldownUntil
-          : now + (this.#options.quotaCooldownMs ?? DEFAULT_QUOTA_COOLDOWN_MS)
-      entry.cooldownUntil = until > now ? Math.min(until, now + MAX_QUOTA_COOLDOWN_MS) : undefined
+      if (typeof info.cooldownUntil === 'number') {
+        entry.cooldownUntil = info.cooldownUntil > now ? info.cooldownUntil : undefined
+        entry.cooldownKind = entry.cooldownUntil === undefined ? undefined : 'hard'
+      } else {
+        entry.cooldownUntil = now + (this.#options.quotaCooldownMs ?? DEFAULT_QUOTA_COOLDOWN_MS)
+        entry.cooldownKind = 'soft'
+      }
     }
     this.#persist(registry)
   }
@@ -916,7 +988,12 @@ export class AccountPool {
     // writing off an account over one transient network blip.
     if (kind === 'auth') {
       const now = this.#now()
+      // A failed refresh is a *guess* about the next window: the grant may be
+      // permanently dead, or the token endpoint may have had a bad minute, and
+      // only a request tells them apart. So it parks softly — deprioritised,
+      // never written off.
       entry.cooldownUntil = Math.max(entry.cooldownUntil ?? 0, now + AUTH_COOLDOWN_MS)
+      if (entry.cooldownKind !== 'hard') entry.cooldownKind = 'soft'
     }
     this.#persist(registry)
   }
@@ -987,6 +1064,7 @@ export class AccountPool {
     if (entry === undefined) return 'missing'
     if (entry.cooldownUntil === undefined) return 'idle'
     entry.cooldownUntil = undefined
+    entry.cooldownKind = undefined
     this.#persist(registry)
     return 'cleared'
   }

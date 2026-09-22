@@ -370,6 +370,13 @@ export class GoogleAntigravityAdapter extends LlmAdapter {
           // account, so it is reported as-is.
           if (!accountScoped(error)) throw error
           if (options.signal?.aborted) throw error
+          // A quota the provider *quantified* is not "this account is busy", it
+          // is "this account is spent until <time>". Walking the rest of the pool
+          // cannot change that — every other account already carries its own park
+          // or it would have been chosen first — so the walk stops here and the
+          // user gets the provider's own message instead of the last of N
+          // identical 429s.
+          if (quantifiedQuota(error)) throw error
         }
       }
 
@@ -506,14 +513,23 @@ export class GoogleAntigravityAdapter extends LlmAdapter {
         const error = new LlmError(
           res.status === 429 ? quotaMessage(base, res.status, body) : `Antigravity 端点 ${base} 返回 ${res.status}: ${body.slice(0, 500)}`,
           code
-        ) as LlmError & { retryAtMs?: number }
-        // A *quota* 429 body usually says when the quota resets. Keep that as a
-        // fact on the error so the pool can park this account for exactly that
-        // long instead of guessing, and so the next call goes elsewhere. A 429
-        // the body does not explain is `RATE_LIMIT` instead: it is no more this
-        // account's fault than the endpoint's, so nothing is parked, no cooldown
-        // is invented, and the retry policy gets to try again.
-        if (code === 'QUOTA_EXCEEDED') {
+        ) as LlmError & { retryAtMs?: number; quotaScoped?: boolean }
+        // Every 429 is *this account* being throttled, whether or not the body
+        // explains itself, so the pool may offer a different one. That is
+        // recorded separately from `code` because the two answer different
+        // questions: `code` decides whether DSH's retry policy picks the call up
+        // again (it retries `RATE_LIMIT`, never `QUOTA_EXCEEDED`), while
+        // `quotaScoped` decides whether the credential pool should try another
+        // account first. A body naming no quota keeps `RATE_LIMIT` — calling it
+        // "quota exhausted" would misreport a burst limit and permanently opt
+        // the call out of retries.
+        //
+        // A body that says when the quota resets is a *fact*: `retryAtMs` carries
+        // it so the pool parks this account for exactly that long and stops
+        // walking. A body that says nothing leaves it unset, and the pool falls
+        // back to a short guessed window it is allowed to re-test.
+        if (res.status === 429) {
+          error.quotaScoped = true
           const retryAt = parseQuotaResetMs(body)
           if (retryAt !== undefined) error.retryAtMs = retryAt
           scopedError = scopedError ?? error
@@ -555,24 +571,60 @@ export class GoogleAntigravityAdapter extends LlmAdapter {
  * rejected identically by every account, and retrying it would multiply a bad
  * request by the size of the pool.
  *
+ * Every 429 qualifies, including one the body does not explain. `code` is not
+ * consulted for that case on purpose: a 429 that names no quota is deliberately
+ * left `RATE_LIMIT` so DSH's retry policy still handles it, but it is still this
+ * account being throttled, so the pool must be free to offer a different one.
+ *
  * @param error - the failure a stream attempt produced.
  * @returns whether the pool should be asked for the next account.
  */
 function accountScoped(error: unknown): boolean {
-  const code = (error as { code?: unknown } | null | undefined)?.code
-  return code === 'QUOTA_EXCEEDED' || code === 'INVALID_CREDENTIAL'
+  const failure = error as { code?: unknown; quotaScoped?: unknown } | null | undefined
+  return failure?.code === 'QUOTA_EXCEEDED' || failure?.code === 'INVALID_CREDENTIAL' || failure?.quotaScoped === true
+}
+
+/**
+ * Whether a rejection came with the provider's own reset time.
+ *
+ * This is the higher-confidence grade: the body quantified its recovery
+ * (`Resets in 3h12m`), so the park it produces is a fact rather than a guess.
+ * Such a failure is not worth another account or another attempt — it is the
+ * final answer for this call.
+ *
+ * A rejection whose body says nothing quantifiable is deliberately *not*
+ * included: it may be a burst limit that clears in seconds, so the walk
+ * continues and a second account gets its turn.
+ *
+ * @param error - the failure a stream attempt produced.
+ * @returns whether the provider stated when the quota resets.
+ */
+function quantifiedQuota(error: unknown): boolean {
+  const failure = error as { quotaScoped?: unknown; retryAtMs?: unknown } | null | undefined
+  return failure?.quotaScoped === true && typeof failure.retryAtMs === 'number'
 }
 
 /** Project one failed attempt into the fact the credential pool records. */
 function failureInfoOf(creds: AntigravityCredentials, error: unknown): AdapterFailureInfo {
-  const code = (error as { code?: unknown } | null | undefined)?.code
+  const failure = error as { code?: unknown; retryAtMs?: unknown; quotaScoped?: unknown } | null | undefined
+  // `quotaScoped` leads: a 429 the body did not explain is still a quota-class
+  // rejection for the pool (soft park, try another account) even though its
+  // `code` stays `RATE_LIMIT` for DSH's retry policy.
   const kind: AdapterFailureInfo['kind'] =
-    code === 'QUOTA_EXCEEDED' ? 'quota' : code === 'INVALID_CREDENTIAL' ? 'auth' : 'other'
-  const retryAt = (error as { retryAtMs?: unknown } | null | undefined)?.retryAtMs
+    failure?.quotaScoped === true
+      ? 'quota'
+      : failure?.code === 'QUOTA_EXCEEDED'
+        ? 'quota'
+        : failure?.code === 'INVALID_CREDENTIAL'
+          ? 'auth'
+          : 'other'
+  const retryAt = failure?.retryAtMs
   return {
     ...(creds.accountId === undefined ? {} : { accountId: creds.accountId }),
     kind,
     message: error instanceof Error ? error.message : String(error),
+    // Only a stated reset time becomes a hard park; a quota failure without one
+    // leaves this unset, and the pool applies its short re-testable window.
     ...(kind === 'quota' && typeof retryAt === 'number' ? { cooldownUntil: retryAt } : {})
   }
 }
