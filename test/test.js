@@ -1,5 +1,6 @@
 import assert from 'node:assert'
 import { Context } from '@deepseek-ai/cordis'
+import { createVolatile, updateVolatile } from '@deepseek-ai/cosmokit'
 import { LlmRuntime } from '@deepseek-ai/dsh-llm'
 import { GoogleAntigravityAdapter, buildRequest, mapUsage, parseQuotaResetMs, parseStream } from '../lib/adapter.js'
 import {
@@ -313,19 +314,38 @@ await ctx.plugin(antigravityPlugin)
 await check('provider route is registered', () => {
   assert(ctx.llm.listProviders().map(provider => provider.id).includes('google-antigravity'))
 })
-await check('configurable entry belongs to llm-antigravity, not llm-pi-ai', () => {
+await check('configurable entry addresses this plugin\'s own entry id', () => {
   const entry = ctx.llm.listConfigurableProviders().find(candidate => candidate.provider === 'google-antigravity')
   assert(entry, 'directory entry must exist')
-  assert.strictEqual(entry.settingsNs, 'llm-antigravity')
+  assert.strictEqual(entry.settingsNs, 'antigravity')
   assert.deepStrictEqual([...entry.settingsPath], ['account'])
   assert.strictEqual(entry.declared, false)
 })
-await check('the account marker has no default, so the entry starts dormant', () => {
-  // `configured` is `settingsPath.length === 0 || getPath(value, settingsPath)
-  // !== undefined`, so an unset marker is what keeps the row out of the page
-  // until somebody signs in.
-  assert.strictEqual(antigravityPlugin.Config({}).account, undefined)
-  assert.strictEqual(antigravityPlugin.Config({ account: 'a@b.c' }).account, 'a@b.c', 'the schema must keep the marker')
+await check('the bundled patch declares the id the settings namespace resolves to', async () => {
+  // The settings service resolves an entry by `entry.options.id === ns`, so the
+  // id this package's own patch inserts **is** the namespace of its Config. If
+  // they drift, every settings write is refused (`No configurable plugin entry`)
+  // and the provider row can never be installed — silently.
+  const { readFileSync } = await import('node:fs')
+  const patch = readFileSync(new URL('../cordis.patch.yml', import.meta.url), 'utf8')
+  const id = /^\s*-\s*id:\s*(\S+)\s*$/m.exec(patch)?.[1]
+  assert.strictEqual(id, 'antigravity', 'the patch must declare the entry id')
+  const entry = ctx.llm.listConfigurableProviders().find(candidate => candidate.provider === 'google-antigravity')
+  assert.strictEqual(entry.settingsNs, id, 'the directory entry must address the declared entry id')
+})
+await check('the account marker is volatile and starts unset, so the entry is dormant', () => {
+  // Two facts the directory entry depends on:
+  //  - the marker is **volatile**, because the settings service only permits
+  //    writes to volatile paths (`isVolatilePath` per path), and the plugin
+  //    writes it on sign-in;
+  //  - it starts unset, because `configured` is
+  //    `settingsPath.length === 0 || getPath(value, settingsPath) !== undefined`,
+  //    which is what keeps the row out of the page until somebody signs in.
+  assert.strictEqual(antigravityPlugin.Config.dict.account.meta.volatile, true)
+  const unset = antigravityPlugin.Config({}).account
+  assert.strictEqual(unset.get(), undefined, 'an absent marker reads as unset')
+  const set = antigravityPlugin.Config({ account: 'a@b.c' }).account
+  assert.strictEqual(set.get(), 'a@b.c', 'the schema must keep the marker')
 })
 await check('model metadata resolves through the runtime', async () => {
   const resolved = await ctx.llm.resolveModelInfo('google-antigravity', 'gemini-3.8-flash')
@@ -414,7 +434,57 @@ function fakeReact(initialStates = [], refs = []) {
   }
 }
 
-const fakePrimitives = { Button: 'button' }
+/**
+ * The primitives the client half consumes. The settings-form entries are
+ * stand-ins that expose the same surface the real ones do, so the config card
+ * can mount and its wiring can be asserted: `SettingsFormModel` stages edits
+ * and writes on save in the real one, so the fake mirrors
+ * `bind`/`shell`/`field`/`actions`/`dispose` and records what was called.
+ */
+const fakePrimitives = {
+  Button: 'button',
+  SettingsForm: 'SettingsForm',
+  SettingsValueField: 'SettingsValueField',
+  settingsNumberField: field => ({
+    field,
+    format: value => (typeof value === 'number' ? String(value) : ''),
+    parse: text => (String(text).trim() === '' ? { kind: 'clear' } : { kind: 'set', value: Number(text) })
+  }),
+  settingsTextField: field => ({
+    field,
+    format: value => (typeof value === 'string' ? value : ''),
+    parse: text => (String(text).trim() === '' ? { kind: 'clear' } : { kind: 'set', value: String(text).trim() })
+  }),
+  SettingsFormModel: class {
+    constructor(scope, specs) {
+      this.scope = scope
+      this.specs = specs
+      this.disposed = false
+      this.calls = []
+    }
+    bind(project) {
+      this.projection = project
+      return { getSnapshot: () => project() }
+    }
+    shell() {
+      return { available: true, writable: true, dirty: false, invalid: false, saving: false, failed: false }
+    }
+    field(name) {
+      return { text: '', overridden: false, invalid: false }
+    }
+    actions() {
+      return {
+        edit: (field, text) => { this.calls.push(['edit', field, text]) },
+        resetField: field => { this.calls.push(['resetField', field]) },
+        save: () => { this.calls.push(['save']) },
+        discard: () => { this.calls.push(['discard']) }
+      }
+    }
+    dispose() {
+      this.disposed = true
+    }
+  }
+}
 
 function requireFace(react) {
   return specifier => {
@@ -442,12 +512,17 @@ function textOf(node, out = []) {
 const clientExports = registration.factory(requireFace(fakeReact()))
 await check('bundle exports apply/inject', () => {
   assert.strictEqual(typeof clientExports.apply, 'function')
-  assert.deepStrictEqual([...clientExports.inject], ['slots'])
+  // `configForms` joined `slots` in 0.1.7: the Plugins page's configuration card
+  // reads and writes the active profile's plugin Config through it.
+  assert.deepStrictEqual([...clientExports.inject], ['slots', 'configForms'])
 })
 await check('apply registers the provider-card cell', () => {
   const injections = []
   const registrations = []
   const fakeCtx = {
+    // No `configForms`: this case is about the provider card, and the config
+    // card must simply not register when the service is absent.
+    get: () => undefined,
     slots: {
       inject(key, callback) {
         injections.push(key)
@@ -462,8 +537,154 @@ await check('apply registers the provider-card cell', () => {
   clientExports.apply(fakeCtx)
   assert.deepStrictEqual(injections, ['settings.models.provider-card', 'conversation.view'])
   const card = registrations.find(entry => entry.options.name === 'settings.models.provider-card')
-  assert.strictEqual(card.options.key, 'llm-antigravity')
+  // The settings page dispatches this slot with `{ entryKey: row.entry.settingsNs }`,
+  // and the Host half resolves that to the profile entry id (`antigravity`). A key
+  // that does not match renders nothing — no account list, no sign-in button.
+  assert.strictEqual(card.options.key, 'antigravity')
   assert.strictEqual(typeof card.component, 'function')
+})
+
+/**
+ * Run `apply` with a `configForms` service standing in for the real one, so the
+ * config card's registration and baked-in contract can be inspected.
+ *
+ * The fake records the namespace it was asked for and exposes a scope shaped
+ * like the real controller's snapshot (`value` / `base` / `user`), which is what
+ * `SettingsFormModel` reads.
+ */
+function applyWithConfigForms() {
+  const requested = []
+  const registrations = []
+  const effects = []
+  const fakeCtx = {
+    configForms: {
+      get(ns) {
+        requested.push(ns)
+        return {
+          getSnapshot: () => ({ status: 'ready', writable: true, value: {}, base: {}, user: {} }),
+          subscribe: () => () => {},
+          mutate: async () => true
+        }
+      }
+    },
+    effect(fn) {
+      effects.push(fn)
+      return () => {}
+    },
+    get: () => undefined,
+    slots: {
+      inject(key, callback) {
+        callback()
+      },
+      register(options, component) {
+        registrations.push({ options, component })
+        return () => {}
+      }
+    }
+  }
+  clientExports.apply(fakeCtx)
+  return { requested, registrations, effects }
+}
+
+await check('config card addresses the profile entry id, not the provider namespace', () => {
+  const { requested } = applyWithConfigForms()
+  // The Plugins page keys a package's form by the entry's own id; the
+  // `llm-antigravity` namespace is the provider row in Settings → Models.
+  assert.deepStrictEqual(requested, ['antigravity'])
+})
+
+await check('config card registers under the bundle package name', () => {
+  const { registrations } = applyWithConfigForms()
+  const entry = registrations.find(r => r.options.name === 'plugins.bundle.config')
+  assert.ok(entry, 'plugins.bundle.config was not registered')
+  // The page looks the card up by the bundle's package name.
+  assert.strictEqual(entry.options.key, 'dsh-antigravity')
+  assert.strictEqual(typeof entry.component, 'function')
+})
+
+await check('config card injects the form actions the official form needs', () => {
+  const { registrations } = applyWithConfigForms()
+  const entry = registrations.find(r => r.options.name === 'plugins.bundle.config')
+  const injected = entry.options.inject()
+  // `SettingsForm` is driven entirely by these four; a card that omits them
+  // renders a save bar that does nothing.
+  for (const action of ['edit', 'resetField', 'save', 'discard']) {
+    assert.strictEqual(typeof injected[action], 'function', `missing action ${action}`)
+  }
+  assert.ok(injected.hooks && injected.hooks.antigravityConfig, 'missing bound form hook')
+})
+
+await check('config card exposes only flat scalar fields', () => {
+  const { registrations } = applyWithConfigForms()
+  const entry = registrations.find(r => r.options.name === 'plugins.bundle.config')
+  const injected = entry.options.inject()
+  const snapshot = injected.hooks.antigravityConfig.getSnapshot()
+  // A nested name (`proxy.enabled`) addresses a literal top-level key, so every
+  // field must be a flat scalar the Host schema declares.
+  assert.deepStrictEqual(
+    Object.keys(snapshot).filter(k => k !== 'shell').sort(),
+    ['accountStrategy', 'proxyEnabled', 'proxyHost', 'proxyPort', 'reasoningEffort', 'usageEnabled', 'usageRetentionDays']
+  )
+  for (const key of Object.keys(snapshot)) {
+    assert.ok(!key.includes('.'), `field ${key} is dotted and cannot be resolved by the form`)
+  }
+})
+
+await check('config card fields all exist in the Host schema', async () => {
+  const { registrations } = applyWithConfigForms()
+  const entry = registrations.find(r => r.options.name === 'plugins.bundle.config')
+  const snapshot = entry.options.inject().hooks.antigravityConfig.getSnapshot()
+  const host = await import('../lib/index.js')
+  const dict = host.Config.dict
+  for (const key of Object.keys(snapshot)) {
+    if (key === 'shell') continue
+    assert.ok(dict[key] !== undefined, `field ${key} is not declared by the Host Config`)
+    assert.strictEqual(dict[key].meta?.volatile, true, `field ${key} is not volatile, so no form is rendered`)
+  }
+})
+
+/** Depth-first search for the first element created from `type`. */
+function findByType(node, type) {
+  if (node == null || typeof node !== 'object') return null
+  if (Array.isArray(node)) {
+    for (const child of node) {
+      const hit = findByType(child, type)
+      if (hit) return hit
+    }
+    return null
+  }
+  if (node.type === type) return node
+  return findByType(node.props && node.props.children, type)
+}
+
+await check('插件页配置卡自带账号与登录界面', () => {
+  const { registrations } = applyWithConfigForms()
+  const entry = registrations.find(r => r.options.name === 'plugins.bundle.config')
+  // The card stacks the account manager over the settings form; rendering the
+  // element is enough to assert the wiring, because the manager is the same
+  // component the provider card mounts.
+  const tree = entry.component({
+    useAntigravityConfig: () => ({
+      shell: { available: true, writable: true, dirty: false, invalid: false, saving: false, failed: false }
+    }),
+    edit: () => {},
+    resetField: () => {},
+    save: () => {},
+    discard: () => {}
+  })
+  assert.ok(
+    findByType(tree, clientExports.AntigravityCard),
+    '插件页的配置卡必须自己带上账号/登录界面，而不是只在「设置 → 模型」里'
+  )
+})
+
+await check('插件页里那份账号卡渲染登录按钮', () => {
+  const face = registration.factory(requireFace(fakeReact()))
+  // No `provider` prop: the Plugins page dispatches this cell with none, and
+  // the manager must not drop itself for lack of one.
+  const text = textOf(face.AntigravityCard({})).join(' | ')
+  assert.match(text, /未登录/, 'must state the signed-out status')
+  assert.match(text, /登录 Google 账号/, 'must render the sign-in button label')
 })
 
 /** Run `apply` against a stubbed host answer for the account probe. */
@@ -1023,16 +1244,42 @@ console.log('# 9. 账户标记：默认不出现，登录后出现，移除后�
 /** A stand-in for `ctx.settings`: records writes and can replay a removal. */
 function fakeSettings(initial = {}) {
   let value = { ...initial }
-  let hooks = null
+  /**
+   * The 0.1.7 settings contract, in the two ways it differs from the section API
+   * this fake used to model:
+   *
+   * 1. An entry is resolved by `entry.options.id === ns`, so a write addressed
+   *    to a name the profile did not declare is refused — that is how the real
+   *    service behaves (`write()` throws `No configurable plugin entry`), and
+   *    modelling it is what catches an id that drifted from the profile patch.
+   * 2. Only **volatile** fields may be written (`isVolatilePath` is checked per
+   *    path), which is why the `account` marker is declared volatile.
+   *
+   * A committed write then reaches the plugin the same way the Loader delivers
+   * it: the volatile reference is updated in place, and `loader/volatile-update`
+   * fires (see `_commitVolatile`).
+   */
+  const listeners = []
   const calls = []
+  /** Deliver a committed change the way the Loader does: ref updated, then event. */
+  const notify = () => {
+    for (const fn of listeners) fn()
+  }
+  /** Entry ids the profile declares, as the live fiber's `options.id` reports. */
+  const declared = new Set(['antigravity'])
+  /** Paths the schema marks volatile, as `isVolatilePath` decides. */
+  const volatilePaths = new Set(['account', 'accountStrategy', 'reasoningEffort',
+    'proxyEnabled', 'proxyHost', 'proxyPort', 'usageEnabled', 'usageRetentionDays'])
   return {
     service: {
-      installSection(owner, ns, schema, entry, captured) {
-        hooks = captured
-        captured.setSource(() => value)
-        captured.onChange()
-      },
       async mutate(ns, ops) {
+        if (!declared.has(ns)) throw new Error(`No configurable plugin entry "${ns}"`)
+        for (const op of ops) {
+          const key = op.path.join('.')
+          if (op.path.length !== 0 && !volatilePaths.has(key)) {
+            throw new Error(`Config field "${key}" is not volatile`)
+          }
+        }
         calls.push({ ns, ops })
         for (const op of ops) {
           if (op.path.length !== 1) continue
@@ -1042,26 +1289,32 @@ function fakeSettings(initial = {}) {
             value = rest
           }
         }
-        if (hooks) hooks.onChange()
+        notify()
       }
     },
     calls,
     read: () => value,
+    /** Register the plugin's volatile-update listener (what `ctx.on` does). */
+    listen(fn) {
+      listeners.push(fn)
+      return () => {
+        const at = listeners.indexOf(fn)
+        if (at >= 0) listeners.splice(at, 1)
+      }
+    },
     /** What the row's native 「移除」 does: unset the path, then notify. */
     removeAccountMarker() {
       const { account, ...rest } = value
       value = rest
-      if (hooks) hooks.onChange()
+      notify()
     },
     /** A settings reload that brings the marker back (see the flicker case). */
     setAccountMarker(label) {
       value = { ...value, account: label }
-      if (hooks) hooks.onChange()
+      notify()
     },
     /** Any unrelated settings edit. */
-    notify() {
-      if (hooks) hooks.onChange()
-    }
+    notify
   }
 }
 
@@ -1076,8 +1329,47 @@ markerCtx.provide('webServer', {
   }
 })
 markerCtx.provide('settings', markerSettings.service)
+/**
+ * The `account` marker as the plugin observes it.
+ *
+ * Under 0.1.7 a volatile Config field arrives as a **stable reference** and a
+ * committed settings write updates that ref **in place** (`updateVolatile`),
+ * which is what `_commitVolatile` does on a real edit — the plugin is never
+ * reloaded. The ref is taken from the plugin's own schema, so this exercises the
+ * real wrapping rather than a hand-built stand-in.
+ *
+ * The plugin is applied through `apply` directly (not `ctx.plugin`): `ctx.plugin`
+ * re-validates its config against the schema, and a ref is not a string. Resolving
+ * once and handing the refs across is precisely what the Loader does, so this is
+ * the production shape, not a shortcut.
+ */
+const markerAccountRef = antigravityPlugin.Config['~standard'].validate({}).value.account
+assert(markerAccountRef && typeof markerAccountRef.get === 'function', 'account must resolve to a volatile ref')
 const markerPort = await freePort()
-await markerCtx.plugin(antigravityPlugin, { redirectUri: `http://127.0.0.1:${markerPort}/oauth-callback` })
+/**
+ * Apply the plugin with the resolved config, the way the Loader does.
+ *
+ * `ctx.plugin` would validate the config again and reject the ref (a ref is not
+ * a string), so the plugin is applied directly on this context with the resolved
+ * config in hand. That resolved config is what the plugin reads, and the
+ * `account` ref inside it is the object a committed settings write updates.
+ */
+const markerApplyConfig = {
+  redirectUri: `http://127.0.0.1:${markerPort}/oauth-callback`,
+  account: markerAccountRef
+}
+antigravityPlugin.apply(markerCtx, markerApplyConfig)
+assert(markerApplyConfig.account === markerAccountRef, 'apply must receive the ref')
+// A committed marker write reaches the plugin as a volatile update, not as a new
+// config object; mirror that ordering.
+markerSettings.listen(() => {
+  // Deliver the commit the way the Loader does: update the ref the plugin holds,
+  // *then* signal it. Each schema resolution mints a distinct ref, so the service
+  // and the plugin must share one — resolving once and passing that ref across is
+  // precisely what the Loader does.
+  updateVolatile(markerAccountRef, { get: () => markerSettings.read().account })
+  markerCtx.emit('loader/volatile-update', markerCtx.fiber)
+})
 await settle()
 
 async function markerCall(method, path) {
@@ -1094,15 +1386,73 @@ await check('signed out: looking at the card installs nothing', async () => {
   assert.deepStrictEqual(markerSettings.calls, [], 'no marker may be written without an account')
   assert.strictEqual(markerSettings.read().account, undefined)
 })
+await check('a pre-existing account gets its marker back at load, without any UI', async () => {
+  // The deadlock this guards: the provider row only renders when `settingsPath`
+  // (`['account']`) resolves, and the card used to be the only writer of that
+  // marker — no marker, no row; no row, no card; no card, no writer. A grant
+  // that predates the marker therefore never became visible.
+  //
+  // So the repair must happen at load, from the pool alone. This mounts a fresh
+  // context with an account on disk but no marker, and asserts the marker lands
+  // *before* anything reads a card.
+  const { Context } = await import('@deepseek-ai/cordis')
+  const { LlmRuntime } = await import('@deepseek-ai/dsh-llm')
+  const fresh = new Context()
+  new LlmRuntime(fresh)
+  const calls = []
+  let value = {}
+  fresh.provide('settings', {
+    async mutate(ns, ops) {
+      if (ns !== 'antigravity') throw new Error(`No configurable plugin entry "${ns}"`)
+      calls.push({ ns, ops })
+      for (const op of ops) {
+        if (op.op === 'set') value = { ...value, [op.path[0]]: op.value }
+      }
+    }
+  })
+  // A grant already on disk. The pool reads the **accounts registry**, not the
+  // auth file, so seed that.
+  writeAccountRegistry({
+    version: 1,
+    activeId: 'load-repair',
+    accounts: [{
+      id: 'load-repair',
+      label: 'load-repair',
+      projectId: 'load-repair',
+      addedAt: Date.now(),
+      creds: { access: 'seeded-access', projectId: 'load-repair', expires: Date.now() + 3_600_000 }
+    }]
+  })
+  const ref = antigravityPlugin.Config['~standard'].validate({}).value.account
+  antigravityPlugin.apply(fresh, { account: ref, redirectUri: 'http://127.0.0.1:1/cb' })
+  await new Promise(r => setTimeout(r, 20))
+  assert.deepStrictEqual(
+    calls.filter(c => c.ops[0].op === 'set'),
+    [{ ns: 'antigravity', ops: [{ op: 'set', path: ['account'], value: 'load-repair' }] }],
+    'load must publish the marker for an account that already exists'
+  )
+  // Put the registry back to empty: the suite's later cases seed their own, and a
+  // leftover account here would make them see a marker they did not expect.
+  writeAccountRegistry({ version: 1, activeId: null, accounts: [] })
+})
 await check('an account with no marker installs the row when the card reads it', async () => {
   writeAuthFile({ access: 'seeded-access', projectId: 'aicode-consumers', expires: Date.now() + 3_600_000 })
   const { body } = await markerCall('GET', STATUS)
   assert.strictEqual(body.authenticated, true)
   const set = markerSettings.calls.filter(call => call.ops[0].op === 'set')
+  // The namespace is the **entry id**, resolved off the live fiber; this context
+  // applies the plugin bare, so it falls back to the package's own constant —
+  // which must equal the id the bundled patch declares.
   assert.deepStrictEqual(set, [
-    { ns: 'llm-antigravity', ops: [{ op: 'set', path: ['account'], value: 'aicode-consumers' }] }
+    { ns: 'antigravity', ops: [{ op: 'set', path: ['account'], value: 'aicode-consumers' }] }
   ])
   await markerCall('GET', STATUS)
+  // The guard compares the live marker against the label it would write. If the
+  // plugin cannot see the committed value, every read rewrites the same marker.
+  assert.strictEqual(
+    markerAccountRef.get(), 'aicode-consumers',
+    'the committed marker must be visible through the ref the plugin reads'
+  )
   assert.strictEqual(markerSettings.calls.length, 1, 'a present marker must not be rewritten')
 })
 await check('an unrelated settings edit keeps the grant', async () => {

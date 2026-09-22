@@ -12,7 +12,7 @@ DeepSeek Harness (DSH) 的 **Google Antigravity** 模型提供商插件：原生
 | --- | --- |
 | 原生提供商路由 | 提供商目录挂在插件自有的 `llm-antigravity` 命名空间；`google-antigravity` 只由原生适配器提供 |
 | 多账号 + 配额故障转移 | 可登录多个 Google 账号；按 `accountStrategy` 轮询或优先默认账号；某账号 429 配额耗尽时**当次调用**直接换号，并把它停用一个短窗口（重置时间封顶 5 分钟） |
-| 设置页账号管理 | 通过 `settings.models.provider-card` 插槽在「设置 → 模型 → Google Antigravity」卡片内列出全部账号：健康、项目、令牌有效期、冷却倒计时，以及添加 / 设为默认 / 逐个退出 |
+| 账号与登录界面 | 同一张账号卡渲染在两个位置：**设置 → 模型 → Google Antigravity**（`settings.models.provider-card` 插槽）与侧边栏**插件**页里 dsh-antigravity 的页面（`plugins.bundle.config` 插槽）。列出全部账号：健康、项目、令牌有效期、冷却倒计时，以及登录 / 添加 / 设为默认 / 逐个退出 |
 | 自有凭据存储 | 账号清单写在 `~/.dsh/antigravity-accounts.json`；`ctx.credentials`（`dsh-antigravity/google-antigravity` 记录）与 `~/.dsh/antigravity-auth.json` 始终镜像**默认账号**，旧安装无需迁移 |
 | 可选 OpenAI 兼容代理 | `proxy.enabled` 开启（默认关闭）时，为不能加载 DSH 插件的客户端提供 OpenAI 兼容端点 |
 | 思考与工具调用解析 | 只以 `part.thought === true` 判定思考过程；块状态机解析流式响应；工具调用优先于 `max-tokens` |
@@ -40,6 +40,8 @@ DeepSeek Harness (DSH) 的 **Google Antigravity** 模型提供商插件：原生
 | **取消** | 等待授权时点 **取消**（或关掉授权页直到 10 分钟超时） | 结束本次尝试，卡片说明原因 |
 
 卡片在两种位置都会渲染：下拉里的草稿卡（此时是「添加」）和已经成行的行卡（此时是「管理」）。状态与操作完全一致。标记落地、行出现后**草稿卡立即退场**：原生页面不会替你合上那张草稿卡（写 settings 的是插件自己，没有任何编辑器关闭动作会来清理它），而 `account` 已经让这个条目从下拉里消失 —— 留在原地的卡片会被看成挂在下拉回退显示的那个提供方上。此后状态与操作由行卡独占：
+
+侧边栏**插件**页里 dsh-antigravity 的页面挂的是**同一个** `AntigravityCard`：账号区在最上、配置表单在下面。所以「没有账户 → 添加 → 登录」这条闭环不依赖设置页 —— 一个连 `account` 标记都没有的安装，从插件页也能登进去。
 
 | 卡片状态 | 显示 | 可用的操作 |
 | --- | --- | --- |

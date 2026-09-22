@@ -1,3 +1,21 @@
+# dsh-antigravity 的加载点。
+#
+# `config` 块是**必需的**，不是可选的样式：DSH 0.1.7 起「插件」页只为**条目上带 config
+# 的插件**渲染配置区（页面的 `ledger.bundles` 收集注册了 `plugins.bundle.config` 槽的
+# 包，而条目没有 config 时那份布景压根不存在）。这里把用户可改的字段的默认值显式写出来 ——
+# 形状与官方 `@deepseek-ai/dsh-agent-loop` 的 `config: { agents: [] }` 同款。
+#
+# 这些字段在 Host 半边的 Config 里都是 `.volatile()`：改一个字段不需要重载插件，Loader
+# 把新值提交进那个稳定引用再发 `loader/volatile-update`，插件在那里重新结算账号池、
+# 兼容代理与用量库。其余字段（clientId/clientSecret/endpoint/retryPolicy 与
+# account 标记）不是用户偏好，留在 profile patch 里手配。
 - insert:
     - id: antigravity
       name: 'dsh-antigravity'
+      config:
+        accountStrategy: round-robin
+        proxyEnabled: false
+        proxyHost: 127.0.0.1
+        proxyPort: 8045
+        usageEnabled: true
+        usageRetentionDays: 0

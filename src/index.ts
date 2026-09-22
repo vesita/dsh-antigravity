@@ -68,8 +68,18 @@ export const version: string = (() => {
   }
 })()
 
-/** Settings namespace this plugin owns. */
-const NS = 'llm-antigravity'
+/**
+ * Settings namespace this plugin owns — the profile entry id its Config lives
+ * under.
+ *
+ * The settings service resolves an entry by `entry.options.id === ns`, so this
+ * must equal the `id:` the profile patch declares for this package. It is read
+ * off the live fiber at runtime ({@link settingsNs}) and this constant is the
+ * fallback for a host with no entry (the standalone CLI, a bare `apply()` in a
+ * test). The two must stay in step: the bundled `cordis.patch.yml` declares
+ * `id: antigravity`.
+ */
+const NS = 'antigravity'
 /** The single provider route this plugin serves. */
 const PROVIDER = 'google-antigravity'
 /** Loopback route prefix for the browser half. */
@@ -108,6 +118,19 @@ interface AntigravitySettings {
   redirectUri?: string
   reasoningEffort?: ReasoningEffortId
   retryPolicy?: ResolvedRetryPolicy
+  /**
+   * Compatibility-proxy switch, and its bind address and port.
+   *
+   * These are flat top-level fields rather than the nested `proxy` object below
+   * on purpose: a Plugins-page form addresses fields by a **single key**
+   * (`SettingsFormModel` reads `value?.[field]` and writes `path: [field]`), so
+   * a nested object is not form-addressable. The nested `proxy` object remains
+   * supported as the profile-patch spelling and as the fallback — see
+   * {@link proxySettings}, which is the one place the two are reconciled.
+   */
+  proxyEnabled?: boolean
+  proxyHost?: string
+  proxyPort?: number
   proxy?: {
     enabled?: boolean
     host?: string
@@ -119,6 +142,9 @@ interface AntigravitySettings {
    * Recording is on by default: a provider plugin that silently counts nothing
    * is indistinguishable from a broken one, and the data is local-only.
    */
+  usageEnabled?: boolean
+  /** Drop calls older than this many days; 0 keeps everything. */
+  usageRetentionDays?: number
   usage?: {
     enabled?: boolean
     /** Drop calls older than this many days; 0 keeps everything. */
@@ -189,17 +215,65 @@ const priceOverrideSchema = z.object({
   cacheWrite: z.number().default(0)
 })
 
+/**
+ * The plugin's Config schema.
+ *
+ * DSH 0.1.7 moved plugin settings to the entry's own Config: the Plugins page
+ * renders a form for exactly the schema nodes marked `.volatile()`, and saving
+ * one writes the new value into the running fiber and emits
+ * `loader/volatile-update` — no plugin reload. So the split below is the
+ * contract for *what the user can edit in the UI*:
+ *
+ * - **volatile** — the flat scalar knobs a user tunes from the Plugins page: the
+ *   account pool strategy, the reasoning effort, the compatibility proxy
+ *   (enabled / host / port), and usage accounting (enabled / retention).
+ *   Deliberately flat: a form field is addressed by a single key, so a nested
+ *   object is not editable there.
+ * - **plain** — fields that are not user preferences or are not form-shaped.
+ *   `account` is a directory marker this plugin writes on sign-in
+ *   (`settingsPath: ['account']` is what makes the provider row appear in
+ *   Settings → Models), so an editable field for it would let the UI lie about
+ *   whether a grant exists. The OAuth app identity (`clientId`/`clientSecret`/
+ *   `redirectUri`/`projectId`/`endpoint`) and `retryPolicy` are deployment
+ *   configuration: they belong in the profile patch, and a plain-text secret
+ *   field is worse than no field. `models` is an array, so it is edited through
+ *   Settings → Models rather than as a text field here.
+ *
+ * Reading a volatile field is not the same as reading the literal it was built
+ * from: after the Loader commits a change the field holds the new value, but
+ * `JSON.stringify` of a volatile shows `{}`. Consumers read through
+ * {@link current}, which resolves both shapes.
+ */
 export const Config = z.object({
-  account: z.string(),
-  accountStrategy: z.union(['round-robin', 'active-first']).default('round-robin'),
+  // Volatile because the settings service only permits writes to volatile
+  // fields (`isVolatilePath` is checked on every path of every op), and this one
+  // is a **machine-written marker**: the plugin sets it on sign-in and clears it
+  // when the last account goes away, which is what makes the provider row appear
+  // in and disappear from Settings → Models. It is deliberately absent from the
+  // Plugins-page form — a user-editable field here would let the UI claim a grant
+  // exists when none does.
+  account: z.string().volatile(),
+  accountStrategy: z.union(['round-robin', 'active-first']).default('round-robin').volatile(),
+  // Not volatile: the model list is an array, and a Plugins-page form edits one
+  // scalar per field (`path: [field]`), so it cannot be addressed as a form
+  // field. Model selection belongs to Settings → Models, which already owns the
+  // provider row and its catalog; an array-of-objects text field here would be a
+  // worse editor for the same data.
   models: z.array(modelSchema).default(MODEL_CATALOG),
   endpoint: z.string().default('https://daily-cloudcode-pa.googleapis.com'),
   projectId: z.string(),
   clientId: z.string(),
   clientSecret: z.string(),
   redirectUri: z.string().default('http://127.0.0.1:51121/oauth-callback'),
-  reasoningEffort: z.union(REASONING_EFFORTS.map(effort => effort.id)),
+  reasoningEffort: z.union(REASONING_EFFORTS.map(effort => effort.id)).volatile(),
   retryPolicy: RetryPolicySchema,
+  // Flat, form-addressable spellings of the proxy settings. The Plugins page can
+  // only edit a field by its own single key, so the knobs a user tunes live at
+  // the top level; the nested `proxy` object below stays as the profile-patch
+  // spelling and the fallback (reconciled in `proxySettings`).
+  proxyEnabled: z.boolean().default(false).volatile(),
+  proxyHost: z.string().default('127.0.0.1').volatile(),
+  proxyPort: z.number().step(1).min(1).max(65535).default(8045).volatile(),
   proxy: z
     .object({
       enabled: z.boolean().default(false),
@@ -207,6 +281,10 @@ export const Config = z.object({
       port: z.number().step(1).min(1).max(65535).default(8045)
     })
     .default({ enabled: false, host: '127.0.0.1', port: 8045 }),
+  // Same reasoning as the proxy fields above: the usage-relevant knobs a user
+  // tunes are exposed flat so the Plugins page can address them.
+  usageEnabled: z.boolean().default(true).volatile(),
+  usageRetentionDays: z.number().step(1).min(0).default(0).volatile(),
   usage: z
     .object({
       enabled: z.boolean().default(true),
@@ -228,6 +306,96 @@ export function apply(ctx: any, config: AntigravitySettings = {}): void {
   /** Last observed value of the `account` marker, for set → unset detection. */
   let previousAccount: string | undefined
 
+  /**
+   * Read one schema field, resolving a DSH 0.1.7 volatile reference.
+   *
+   * A `.volatile()` field is **not** a plain value on the config object: it is a
+   * stable reference whose `get()` returns the live value, and the Loader
+   * rewrites that value in place when the user saves the form (`structuredClone`
+   * / `JSON.stringify` of the reference yields `{}`). Fields left non-volatile
+   * arrive as plain values. So every read of a possibly-volatile field goes
+   * through here — reading `config.models` directly would hand the adapter a
+   * reference object instead of the model list.
+   *
+   * @param field - the field name on this plugin's Config.
+   * @returns the live value, or `undefined` when the field is unset.
+   */
+  const read = <K extends keyof AntigravitySettings>(field: K): AntigravitySettings[K] => {
+    const raw: any = (config as any)?.[field]
+    if (raw !== null && typeof raw === 'object' && typeof raw.get === 'function') {
+      return raw.get() as AntigravitySettings[K]
+    }
+    return raw as AntigravitySettings[K]
+  }
+
+  /**
+   * The plugin's live configuration, with volatile fields resolved to values.
+   *
+   * `current` used to be the raw `config` argument, which was correct while
+   * every field was a literal. Now that the user-editable fields are volatile,
+   * a raw read would hand callers reference objects. Rebuilding the object per
+   * call keeps the ~40 existing `current().x` call sites untouched and always
+   * observes the value the Loader committed most recently — which is exactly
+   * what "settings apply live" requires.
+   */
+  current = (): AntigravitySettings => ({
+    account: read('account'),
+    accountStrategy: read('accountStrategy'),
+    models: read('models'),
+    endpoint: read('endpoint'),
+    projectId: read('projectId'),
+    clientId: read('clientId'),
+    clientSecret: read('clientSecret'),
+    redirectUri: read('redirectUri'),
+    reasoningEffort: read('reasoningEffort'),
+    retryPolicy: read('retryPolicy'),
+    proxyEnabled: read('proxyEnabled'),
+    proxyHost: read('proxyHost'),
+    proxyPort: read('proxyPort'),
+    proxy: read('proxy'),
+    usageEnabled: read('usageEnabled'),
+    usageRetentionDays: read('usageRetentionDays'),
+    usage: read('usage')
+  })
+
+  /**
+   * The effective usage-accounting settings, flat fields winning over the
+   * nested object — the same reconciliation {@link proxySettings} performs and
+   * for the same reason.
+   *
+   * @returns whether recording is on and the retention window in days.
+   */
+  const usageSettings = (): { enabled: boolean; retentionDays: number } => {
+    const flat = current()
+    const nested = flat.usage ?? {}
+    return {
+      enabled: flat.usageEnabled ?? nested.enabled ?? true,
+      retentionDays: flat.usageRetentionDays ?? nested.retentionDays ?? 0
+    }
+  }
+
+  /**
+   * The effective proxy settings: the flat form-addressable fields win, the
+   * nested object is the fallback.
+   *
+   * Two spellings exist because two editors write them. The profile patch and
+   * an existing installation use the nested `proxy` object; the Plugins-page
+   * form can only address a single top-level key, so it writes the flat fields.
+   * Both default identically, so "which one is set" only matters once a user has
+   * touched one of them — and the one they touched must win.
+   *
+   * @returns the bind address, port, and whether the proxy should run.
+   */
+  const proxySettings = (): { enabled: boolean; host: string; port: number } => {
+    const flat = current()
+    const nested = flat.proxy ?? {}
+    return {
+      enabled: flat.proxyEnabled ?? nested.enabled ?? false,
+      host: flat.proxyHost ?? nested.host ?? '127.0.0.1',
+      port: flat.proxyPort ?? nested.port ?? 8045
+    }
+  }
+
   // Say which build this is, once, at load. This is the only place the running
   // version becomes visible in a deployment: `dsh-antigravity: v0.3.4 已加载`.
   // Without it, "源码改了但装的是旧 tarball" is invisible from inside.
@@ -243,7 +411,7 @@ export function apply(ctx: any, config: AntigravitySettings = {}): void {
     ctx.logger?.warn?.(`dsh-antigravity: 用量库无法打开，统计功能已禁用：${error.message}`)
   }
 
-  const usageEnabled = (): boolean => usageStore !== null && current().usage?.enabled !== false
+  const usageRecording = (): boolean => usageStore !== null && usageSettings().enabled !== false
 
   /** Merge the settings price overrides over the built-in table. */
   const pricingTable = (): Record<string, ModelPrice> => {
@@ -283,7 +451,7 @@ export function apply(ctx: any, config: AntigravitySettings = {}): void {
       ? null
       : new UsageCollector({
           store: usageStore,
-          enabled: usageEnabled,
+          enabled: usageRecording,
           resolveSession: resolveSessionFacts,
           warn: (message: string) => ctx.logger?.warn?.(`dsh-antigravity: ${message}`)
         })
@@ -291,7 +459,7 @@ export function apply(ctx: any, config: AntigravitySettings = {}): void {
   /** Apply the retention window; runs at load and on every settings change. */
   const pruneUsage = (): void => {
     if (usageStore === null) return
-    const days = Number(current().usage?.retentionDays ?? 0)
+    const days = Number(usageSettings().retentionDays ?? 0)
     if (!Number.isFinite(days) || days <= 0) return
     try {
       usageStore.prune(Date.now() - days * 86_400_000)
@@ -366,7 +534,7 @@ export function apply(ctx: any, config: AntigravitySettings = {}): void {
     const label = markerLabel()
     if (current().account === label) return
     try {
-      await settings.mutate(NS, [{ op: 'set', path: ['account'], value: label }])
+      await settings.mutate(settingsNs(), [{ op: 'set', path: ['account'], value: label }])
     } catch (error: any) {
       // The grant is already committed, so a marker write that fails must not
       // fail the sign-in: the next status read retries it.
@@ -380,7 +548,7 @@ export function apply(ctx: any, config: AntigravitySettings = {}): void {
     const settings = settingsService()
     if (settings === undefined) return
     try {
-      await settings.mutate(NS, [{ op: 'unset', path: ['account'] }])
+      await settings.mutate(settingsNs(), [{ op: 'unset', path: ['account'] }])
     } catch {
       /* gone already, or the settings provider is read-only */
     }
@@ -455,11 +623,28 @@ export function apply(ctx: any, config: AntigravitySettings = {}): void {
   })
 
   const adapterHandle = ctx.llm.registerAdapter([PROVIDER], adapter)
+  /**
+   * The profile entry id this plugin's Config lives under.
+   *
+   * The settings service resolves an entry by `entry.options.id === ns`, and
+   * that id is whatever the profile patch declared (`cordis.patch.yml` →
+   * `id: antigravity`) — not a name this package can fix in advance. So it is
+   * read off the live fiber, exactly as the official `llm-deepseek` adapter does
+   * (`settingsNs: ctx.fiber.entry?.options.id ?? NS`), with the constant kept as
+   * the fallback for a host that has no entry (the standalone CLI, a bare
+   * `apply()` in a test).
+   *
+   * Everything that addresses this plugin's own settings — the directory entry
+   * below and the `account` marker writes — goes through this, never a
+   * hard-coded name: a namespace the profile did not declare makes the service
+   * refuse the write, which silently costs the user their provider row.
+   */
+  const settingsNs = (): string => ctx.fiber?.entry?.options?.id ?? NS
   const directoryHandle = ctx.llm.registerConfigurableProviders([
     {
       provider: PROVIDER,
       displayName: 'Google Antigravity',
-      settingsNs: NS,
+      settingsNs: settingsNs(),
       // A non-empty path is what keeps this entry dormant until the account
       // marker exists: `configured` is false without it, so the provider is
       // listed in 「添加提供方」 instead of owning a row from the start.
@@ -472,8 +657,8 @@ export function apply(ctx: any, config: AntigravitySettings = {}): void {
   // Optional OpenAI-compatible proxy
   // -------------------------------------------------------------------------
   const reconcileProxy = (): void => {
-    const proxy = current().proxy
-    const enabled = proxy?.enabled === true
+    const proxy = proxySettings()
+    const enabled = proxy.enabled === true
     const key = enabled ? `${proxy.host}:${proxy.port}` : null
 
     if (!enabled) {
@@ -512,30 +697,57 @@ export function apply(ctx: any, config: AntigravitySettings = {}): void {
   }
 
   // -------------------------------------------------------------------------
-  // Settings section
+  // Settings
   // -------------------------------------------------------------------------
-  ctx.inject(['settings'], settingsCtx => {
-    settingsCtx.settings.installSection(ctx, NS, Config, config, {
-      setSource: (source: () => AntigravitySettings) => {
-        current = source
-        login.configure(oauthOptions())
-      },
-      onChange: () => {
-        login.configure(oauthOptions())
-        reconcileProxy()
-        reconcileAccount()
-        pruneUsage()
-      },
-      validate: (value: AntigravitySettings) => {
-        if (!Array.isArray(value.models) || value.models.length === 0) {
-          throw new Error('llm-antigravity: models 不能为空；至少保留一个模型')
-        }
-      }
+  // DSH 0.1.7 removed `ctx.settings.installSection` (the whole section API is
+  // gone; `SettingsForms` now only describes the Config of each profile entry).
+  // Plugin preferences are the entry's own volatile Config fields, so this
+  // plugin no longer installs a section — it just has to notice when the Loader
+  // commits an edited field and re-run the effects that depend on it.
+  //
+  // `loader/volatile-update` is that signal: the Loader rewrites the volatile
+  // reference in place and emits the event, so `current()` already sees the new
+  // value by the time this fires. Nothing reloads; the reconcilers below are
+  // how a live settings change reaches the pool, the proxy, and the usage store.
+  //
+  // The whole block stays inside `ctx.inject(['settings'], …)`: the marker write
+  // below needs the service, and `ctx.get` is a synchronous snapshot — reading it
+  // before the service exists yields `undefined`, which the write path treats as
+  // "nothing to do" and returns silently. That is exactly how the marker failed
+  // to be published at all.
+  ctx.inject(['settings'], () => {
+    ctx.on('loader/volatile-update', () => {
+      login.configure(oauthOptions())
+      reconcileProxy()
+      reconcileAccount()
+      pruneUsage()
     })
     login.configure(oauthOptions())
     previousAccount = current().account
     reconcileProxy()
     pruneUsage()
+
+    /**
+     * Repair a missing account marker at load time.
+     *
+     * Why this cannot wait for the card: the provider row only renders when its
+     * `settingsPath` (`['account']`) resolves, and the card is what used to write
+     * the marker (`markAccountInstalled` on a status read). Grants that predate
+     * the marker — or that were installed while the namespace was mis-addressed —
+     * therefore had **no way to ever get one**: no marker means no row, no row
+     * means no card, no card means nothing ever writes the marker. The account
+     * list and its sign-in button stayed invisible while the credentials sat on
+     * disk.
+     *
+     * So the repair happens here, where the plugin can see the pool without any
+     * UI: if accounts exist but no marker does, publish one. It is deliberately
+     * one-way — this only ever *writes* a marker for accounts that already exist,
+     * never clears one, so the removal path (`reconcileAccount` + its grace
+     * period) keeps its single owner.
+     */
+    if (pool.count() > 0 && current().account === undefined) {
+      void markAccountInstalled()
+    }
   })
 
   // -------------------------------------------------------------------------
@@ -759,8 +971,8 @@ export function apply(ctx: any, config: AntigravitySettings = {}): void {
       registerUsageRoutes({
         store,
         pricing: pricingTable,
-        enabled: usageEnabled,
-        retentionDays: () => current().usage?.retentionDays ?? 0,
+        enabled: usageRecording,
+        retentionDays: () => usageSettings().retentionDays ?? 0,
         prefix: USAGE_ROUTE_PREFIX,
         guard,
         /**

@@ -6,8 +6,31 @@
     Object.defineProperty(exports, Symbol.toStringTag, { value: 'Module' })
 
     const React = require('react')
-    const { Button } = require('@deepseek-ai/dsh-client-ui-primitives')
+    const primitives = require('@deepseek-ai/dsh-client-ui-primitives')
+    const Button = primitives.Button
+    /**
+     * The official staged-form primitives. This page reuses them rather than
+     * inventing a save path: `SettingsFormModel` stages a card's edits over one
+     * configuration namespace and writes them on save, `SettingsForm` draws the
+     * save bar, `SettingsValueField` draws one labelled control.
+     */
+    const SettingsForm = primitives.SettingsForm
+    const SettingsValueField = primitives.SettingsValueField
+    const SettingsFormModel = primitives.SettingsFormModel
+    const settingsNumberField = primitives.settingsNumberField
+    const settingsTextField = primitives.settingsTextField
     const h = React.createElement
+
+    /**
+     * The reasoning-effort ids this card offers, mirroring the Host half's
+     * `REASONING_EFFORTS` (`src/models.ts`).
+     *
+     * Spelled out rather than imported because the browser half is bundled
+     * standalone and must not pull in Host modules. The Host re-validates with
+     * its own union, so a drift here can only narrow what the form offers — it
+     * can never write a value the Host does not accept.
+     */
+    const REASONING_EFFORT_IDS = ['off', 'low', 'high']
 
     /**
      * Browser half of dsh-antigravity: the provider card's account manager in
@@ -1182,14 +1205,210 @@
       return h('div', { style: usageStyles.viewRoot }, h(AntigravityUsagePanel, props))
     }
 
-    const inject = ['slots']
+    const inject = ['slots', 'configForms']
+
+    /**
+     * The profile entry id this plugin's Config lives under — the `id:` the
+     * profile patch declares (`cordis.patch.yml` → `id: antigravity`), which is
+     * also the namespace `configForms` addresses.
+     *
+     * Note this is **not** the Host half's `NS` (`llm-antigravity`): that one is
+     * the provider-settings namespace behind the directory row in
+     * Settings → Models. The Plugins page keys a package's form by entry id.
+     */
+    const CONFIG_NS = 'antigravity'
+    /** The bundle package name the Plugins page keys this card by. */
+    const BUNDLE_KEY = 'dsh-antigravity'
+
+    /**
+     * Mount this package's configuration card on the Plugins page.
+     *
+     * DSH 0.1.7 replaced the old `settingsScope` service with `configForms`, the
+     * browser-side controller for the active profile's plugin configuration. A
+     * form is only rendered for a package whose profile entry carries a `config`
+     * block (that is what the page's `ledger.bundles` collects), so the patch
+     * must declare one even when every value is just a default.
+     *
+     * Only **flat scalar** fields can be edited here: `SettingsFormModel` reads
+     * `value?.[field]` and writes `path: [field]`, so a field name is a single
+     * top-level key — `proxy.enabled` would address a literal key of that name,
+     * not the nested object, and an array is not a text field. That is why the
+     * Host schema exposes `proxyEnabled` / `proxyHost` / `proxyPort` alongside
+     * the nested `proxy` object rather than nesting everything.
+     *
+     * @param ctx - the browser plugin context.
+     */
+    function mountConfigCard(ctx: any) {
+      // `configForms` is optional: a deployment without the settings service
+      // (or an older build) simply has no config card. Reading it through a
+      // guard keeps that from throwing and taking the whole browser half down.
+      const forms = ctx && ctx.configForms
+      if (forms === undefined || forms === null || typeof forms.get !== 'function') return
+      const scope = forms.get(CONFIG_NS)
+      if (scope === undefined || scope === null) return
+
+      /**
+       * A boolean rendered as a two-state text field.
+       *
+       * The official primitives ship `settingsNumberField` and
+       * `settingsTextField` but no boolean helper, and `SettingsValueField`
+       * draws a text input. So a switch travels as the text "on"/"off" and is
+       * translated back in `parse`; what reaches the Host is a real boolean.
+       */
+      const booleanField = (field: string) => ({
+        field,
+        format: (value: any) => (value === true ? 'on' : 'off'),
+        parse: (text: string) => ({ kind: 'set', value: String(text).trim() === 'on' })
+      })
+      /** A two-choice field over an enum, also travelling as text. */
+      const choiceField = (field: string, allowed: string[], fallback: string) => ({
+        field,
+        format: (value: any) => (allowed.indexOf(value) >= 0 ? value : ''),
+        parse: (text: string) => {
+          const trimmed = String(text).trim()
+          if (trimmed === '') return { kind: 'clear' }
+          return { kind: 'set', value: allowed.indexOf(trimmed) >= 0 ? trimmed : fallback }
+        }
+      })
+
+      const formModel = new SettingsFormModel(scope, [
+        choiceField('accountStrategy', ['round-robin', 'active-first'], 'round-robin'),
+        choiceField('reasoningEffort', REASONING_EFFORT_IDS, REASONING_EFFORT_IDS[0]),
+        booleanField('proxyEnabled'),
+        settingsTextField('proxyHost'),
+        settingsNumberField('proxyPort'),
+        booleanField('usageEnabled'),
+        settingsNumberField('usageRetentionDays')
+      ])
+      ctx.effect(() => () => formModel.dispose())
+
+      /** Save-bar copy; the official `SettingsForm` label contract. */
+      const formLabels = {
+        unavailable: '本部署没有提供这项配置。',
+        readOnly: '本部署的配置为只读，无法在此修改。',
+        save: '保存',
+        saving: '保存中…',
+        saveFailed: '保存失败，改动未生效。'
+      }
+
+      const formStore = formModel.bind(() => ({
+        shell: formModel.shell(),
+        accountStrategy: formModel.field('accountStrategy'),
+        reasoningEffort: formModel.field('reasoningEffort'),
+        proxyEnabled: formModel.field('proxyEnabled'),
+        proxyHost: formModel.field('proxyHost'),
+        proxyPort: formModel.field('proxyPort'),
+        usageEnabled: formModel.field('usageEnabled'),
+        usageRetentionDays: formModel.field('usageRetentionDays')
+      }))
+      ctx.effect(() => () => formStore.dispose())
+
+      /**
+       * One labelled control. The field's staged text and its override/reset
+       * state both come from the store; the actions come from the slot's inject.
+       */
+      function configField(props: any, id: string, node: any, label: string, hint: string) {
+        return h(
+          SettingsValueField,
+          Object.assign({ key: id, id: id, label: label, hint: hint }, node, {
+            onEdit: function (text: string) {
+              props.edit(id, text)
+            },
+            onReset: function () {
+              props.resetField(id)
+            }
+          })
+        )
+      }
+
+      /** Layout for the two sections this card stacks: accounts, then the form. */
+      const cardStyles = {
+        stack: { display: 'flex', flexDirection: 'column', gap: '12px' },
+        section: { display: 'flex', flexDirection: 'column', gap: '4px' },
+        heading: {
+          fontSize: '12px',
+          lineHeight: '18px',
+          fontWeight: '600',
+          color: 'var(--dsw-alias-label-primary)'
+        }
+      }
+
+      /**
+       * The Plugins page card: the account manager above, the config form below.
+       *
+       * Signing in is not a Settings-page privilege. This card **is** the
+       * plugin's own page, and an install whose account marker is gone (or that
+       * was never signed in) has to be able to add an account from here — the
+       * page that lists the missing grant is exactly where the fix belongs.
+       * Both surfaces mount the same {@link AntigravityCard} over the same host
+       * routes, so the two can never disagree about the pool.
+       */
+      function AntigravityConfigCard(props: any) {
+        const state = props.useAntigravityConfig((snapshot: any) => snapshot)
+        return h(
+          'div',
+          { style: cardStyles.stack },
+          h(
+            'section',
+            { key: 'accounts', style: cardStyles.section },
+            h('div', { key: 'heading', style: cardStyles.heading }, 'Google 账号'),
+            h(AntigravityCard, { key: 'card' })
+          ),
+          h(
+            SettingsForm,
+            {
+              key: 'form',
+              labels: formLabels,
+              state: state.shell,
+              onSave: props.save,
+              onDiscard: props.discard
+            },
+            [
+              configField(props, 'accountStrategy', state.accountStrategy, '账号池策略',
+                'round-robin 轮流使用每个账号；active-first 先用默认账号，配额耗尽再换下一个。'),
+              configField(props, 'reasoningEffort', state.reasoningEffort, '思考强度',
+                '请求时使用的 reasoning effort；留空则用模型自己的默认档。'),
+              configField(props, 'proxyEnabled', state.proxyEnabled, '兼容代理',
+                'on 时在本机开一个 OpenAI 兼容的转发端口，供只认 OpenAI 协议的客户端使用。'),
+              configField(props, 'proxyHost', state.proxyHost, '代理监听地址',
+                '兼容代理绑定的网卡地址，默认 127.0.0.1（仅本机可访问）。'),
+              configField(props, 'proxyPort', state.proxyPort, '代理端口',
+                '兼容代理监听的端口，默认 8045。'),
+              configField(props, 'usageEnabled', state.usageEnabled, '用量统计',
+                'on 时把每次调用的用量记进本地数据库（只在本机，不外发）。'),
+              configField(props, 'usageRetentionDays', state.usageRetentionDays, '用量保留天数',
+                '超过这个天数的调用记录会被清理；0 表示全部保留。')
+            ]
+          )
+        )
+      }
+
+      ctx.slots.inject('plugins.bundle.config', () =>
+        ctx.slots.register(
+          {
+            name: 'plugins.bundle.config',
+            key: BUNDLE_KEY,
+            inject: () => Object.assign({ hooks: { antigravityConfig: formStore } }, formModel.actions())
+          },
+          AntigravityConfigCard
+        )
+      )
+    }
 
     function apply(ctx: any) {
+      mountConfigCard(ctx)
+      /**
+       * The account card's key must equal the provider row's `settingsNs`, which
+       * the Host half resolves to the profile **entry id** (`antigravity`). The
+       * settings page dispatches this slot with `{ entryKey: row.entry.settingsNs }`,
+       * so a stale key here renders nothing at all — the row would appear in
+       * Settings → Models with no account list and no sign-in button.
+       */
       ctx.slots.inject('settings.models.provider-card', () =>
         ctx.slots.register(
           {
             name: 'settings.models.provider-card',
-            key: 'llm-antigravity'
+            key: 'antigravity'
           },
           AntigravityCard
         )

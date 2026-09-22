@@ -1,7 +1,7 @@
 {
   "name": "dsh-antigravity",
-  "version": "0.4.8",
-  "description": "适用于 DeepSeek Harness 的 Google Antigravity 模型提供商适配器插件（原生 LlmAdapter + 多账号管理 UI）",
+  "version": "0.4.12",
+  "description": "DSH 插件：Google Antigravity 模型提供商适配器 —— 原生模型接入，提供多账号管理与用量统计面板",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
@@ -41,6 +41,7 @@
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.3",
+    "@deepseek-ai/cosmokit": "^1.8.4",
     "@deepseek-ai/dsh-llm": "^0.1.7-alpha.1",
     "@types/node": "^22.20.1",
     "typescript": "^7.0.2"
