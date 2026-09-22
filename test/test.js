@@ -110,7 +110,15 @@ const built = await buildRequest(
           { type: 'tool-call', id: 'call_1', name: 'read', arguments: '{"path":"a"}' }
         ]
       },
-      { role: 'user', content: [{ type: 'tool-result', toolCallId: 'call_1', content: [{ type: 'text', text: 'file body' }] }] }
+      {
+        // 0.1.7 起工具结果不再是 user 消息里的 tool-result 内容块，
+        // 而是自己一条 tool 角色消息。
+        role: 'tool',
+        id: 'msg_tool_1',
+        source: { kind: 'tool', callId: 'call_1' },
+        toolCallId: 'call_1',
+        content: [{ type: 'text', text: 'file body' }]
+      }
     ],
     tools: [{ name: 'read', description: 'read a file', parameters: { type: 'object' } }]
   },

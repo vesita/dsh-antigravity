@@ -7,13 +7,13 @@ import type {
   LlmModelInfo,
   LlmProviderInfo,
   LlmResolvedModelInfo,
-  Message,
   ReasoningEffortId,
+  RequestMessage,
   ResolvedRetryPolicy,
   StreamChunk,
   TokenUsage,
   ToolCallBlock,
-  ToolResultBlock
+  ToolResultMessage
 } from '@deepseek-ai/dsh-llm'
 import { MODEL_CATALOG, REASONING_EFFORTS, modelInfoOf, resolveModelSpec } from './models.js'
 import type { ModelSpec } from './models.js'
@@ -172,11 +172,9 @@ export interface AdapterOptions {
 /**
  * Antigravity extension fields this adapter reads that DSH's core content
  * vocabulary does not model: the replayed tool-call signature Antigravity
- * requires, and the legacy `name` some tool-result producers attach beside the
- * call id.
+ * requires.
  */
 type ProviderToolCallBlock = ToolCallBlock & { thoughtSignature?: string }
-type ProviderToolResultBlock = ToolResultBlock & { name?: string }
 
 /** A content block as the request builders read it: only its text projection matters. */
 type TextBearingBlock = ContentBlock & { text?: string }
@@ -711,12 +709,21 @@ export async function buildRequest(
       continue
     }
 
+    // 0.1.7 起，developer 消息只承载工具增删块（tool-addition / tool-removal），
+    // 那是会话内部的工具可见性记录，不是要发给 provider 的对话内容。
+    if (message.role === 'developer') continue
+
     if (message.role === 'assistant') {
       push('model', await assistantParts(message.content, resolveImage))
       continue
     }
 
-    push('user', await userParts(message, toolNames, resolveImage))
+    if (message.role === 'tool') {
+      push('user', [toolResultPart(message, toolNames)])
+      continue
+    }
+
+    push('user', await userParts(message, resolveImage))
   }
 
   const request: AntigravityRequest = { contents }
@@ -756,7 +763,7 @@ export async function buildRequest(
 }
 
 /** Map every assistant tool-call id to its function name across the whole history. */
-function collectToolCallNames(messages: Message[]): Map<string, string> {
+function collectToolCallNames(messages: readonly RequestMessage[]): Map<string, string> {
   const names = new Map<string, string>()
   for (const message of messages) {
     if (message.role !== 'assistant' || !Array.isArray(message.content)) continue
@@ -795,9 +802,32 @@ async function assistantParts(content: MessageContent | null | undefined, resolv
   return parts
 }
 
+/**
+ * One `functionResponse` part for a `tool`-role message.
+ *
+ * 0.1.7 moved tool results out of user content blocks (`tool-result`) into their
+ * own `tool`-role message; the Gemini wire shape is unchanged, so the part is
+ * rebuilt from the message's `toolCallId` plus the function name recovered from
+ * the assistant call that produced it.
+ *
+ * @param message - the durable tool-result message.
+ * @param toolNames - assistant call id → function name, collected from history.
+ */
+function toolResultPart(message: ToolResultMessage, toolNames: Map<string, string>): AntigravityPart {
+  const callId = message.toolCallId
+  const name = (callId && toolNames.get(callId)) || 'tool'
+  const output = resultText(message.content)
+  return {
+    functionResponse: {
+      name,
+      response: message.isError ? { error: output } : { output },
+      ...(callId ? { id: callId } : {})
+    }
+  }
+}
+
 async function userParts(
-  message: Message,
-  toolNames: Map<string, string>,
+  message: RequestMessage,
   resolveImage?: ImageResolver
 ): Promise<AntigravityPart[]> {
   const parts: AntigravityPart[] = []
@@ -814,17 +844,6 @@ async function userParts(
     } else if (block.type === 'image') {
       const inline = await imagePart(block.attachment, resolveImage)
       if (inline) parts.push(inline)
-    } else if (block.type === 'tool-result') {
-      const callId = block.toolCallId || (message.source as { callId?: string })?.callId
-      const name = (callId && toolNames.get(callId)) || (block as ProviderToolResultBlock).name || 'tool'
-      const output = resultText(block.content)
-      parts.push({
-        functionResponse: {
-          name,
-          response: block.isError ? { error: output } : { output },
-          ...(callId ? { id: callId } : {})
-        }
-      })
     }
   }
   return parts
