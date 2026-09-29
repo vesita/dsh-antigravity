@@ -737,7 +737,7 @@
 
     const usageStyles = {
       wrap: { display: 'flex', flexDirection: 'column', gap: '14px', padding: '4px 0' },
-      viewRoot: { flex: '1 1 0', minHeight: 0, overflowY: 'auto', padding: '16px 20px' },
+      viewRoot: { flex: '1 1 0', minHeight: 0, overflowY: 'auto', padding: '16px 20px', position: 'relative', zIndex: 1 },
       toolbar: { display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' },
       spacer: { flex: '1 1 auto' },
       meta: { fontSize: '12px', lineHeight: '18px', color: 'var(--dsw-alias-label-secondary)' },
