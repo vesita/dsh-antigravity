@@ -238,7 +238,7 @@ uuid、扫描用 `会话:事件序号`）：只看主键的话，每一次被观
 | --- | --- | --- |
 | `account` | 未设置 | **账户标记**：存在即表示已有账号安装在此，设置页才会出现该行。值是默认账号的标签（多个账号时形如 `me@gmail.com（共 3 个账号）`）。由插件在登录时写入、全部账号移除时删除；手工删掉它等于移除**全部**账号 |
 | `accountStrategy` | `round-robin` | 账号选择策略：`round-robin` 轮转 / `active-first` 优先默认账号。两者都会在 429/401 时换号，也都会按同一套规则冷却账号：provider 给了重置时间就停到那一刻，没说才停 5 分钟 |
-| `models` | 内置 11 个模型 | 可覆盖/增删；每项含 `id`、`wireId`、`name`、`contextWindow`、`maxTokens`、`reasoning`、`inputModalities` |
+| `models` | 内置 15 个模型 | 可覆盖/增删；每项含 `id`、`wireId`、`name`、`contextWindow`、`maxTokens`、`reasoning`、`inputModalities` |
 | `endpoint` | `https://daily-cloudcode-pa.googleapis.com` | 首选端点，失败后回退到内置端点列表 |
 | `projectId` | 登录时自动发现 | Antigravity 项目 ID，缺省 `aicode-consumers` |
 | `clientId` / `clientSecret` | 内置 Antigravity 客户端 | 可用环境变量覆盖，见下 |
@@ -248,7 +248,7 @@ uuid、扫描用 `会话:事件序号`）：只看主键的话，每一次被观
 | `proxy` | `{ enabled: false, host: 127.0.0.1, port: 8045 }` | 可选 OpenAI 兼容代理 |
 | `usage.enabled` | `true` | 是否记录用量；关闭后不再写库，已有数据保留 |
 | `usage.retentionDays` | `0` | 只保留最近 N 天，`0` = 全部保留；在插件加载与设置变更时清理 |
-| `usage.pricing` | 内置 11 个模型单价 | 覆盖单价表，形如 `[{ model: gemini-3.8-flash, input: 0.75, output: 3.75, cacheRead: 0.075, cacheWrite: 0 }]`，单位 USD / 1M tokens |
+| `usage.pricing` | 内置 15 个模型单价 | 覆盖单价表，形如 `[{ model: gemini-3.8-flash, input: 0.75, output: 3.75, cacheRead: 0.075, cacheWrite: 0 }]`，单位 USD / 1M tokens |
 
 环境变量覆盖（优先级高于内置客户端，低于设置项）：
 
@@ -341,7 +341,7 @@ lib/                      tsc 构建产物（git 忽略，随 npm 包发布）
 ```bash
 pnpm install
 pnpm run build             # tsc → lib/（测试与发布均针对 lib/ 产物）
-pnpm test                  # 构建后跑全部单元测试（169 宿主/浏览器 + 65 用量），无网络、无真实凭据
+pnpm test                  # 构建后跑全部单元测试（171 宿主/浏览器 + 66 用量），无网络、无真实凭据
 pnpm run test:types        # 仅类型检查（Host 半 + 浏览器半两份 tsconfig）
 pnpm pack                  # prepack 会自动 build，产物只含 lib/
 ```

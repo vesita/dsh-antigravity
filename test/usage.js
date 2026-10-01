@@ -85,6 +85,13 @@ check('priceOf 让 tiered 别名回落到基础模型', () => {
   assert.strictEqual(priceOf('unknown-model'), undefined)
 })
 
+check('新增思考档模型按其家族基础模型计价', () => {
+  assert.strictEqual(priceOf('gemini-3.6-flash-high').input, 0.75)
+  assert.strictEqual(priceOf('gemini-3.6-flash-medium').output, 3.75)
+  assert.strictEqual(priceOf('gemini-3.6-flash-low').input, 0.75)
+  assert.strictEqual(priceOf('gemini-3.1-pro-low').output, 12)
+})
+
 console.log('# 2. 失败判定与时间窗')
 
 check('只有 error 算失败，aborted 不算', () => {

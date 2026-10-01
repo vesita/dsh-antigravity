@@ -53,6 +53,15 @@ await check('unknown id falls back to itself', () => {
   const spec = resolveModelSpec('gemini-future-x')
   assert.strictEqual(spec.wireId, 'gemini-future-x')
 })
+await check('official agent-picker ids resolve to their own wire id', () => {
+  for (const id of ['gemini-3.6-flash-high', 'gemini-3.6-flash-medium', 'gemini-3.6-flash-low', 'gemini-3.1-pro-low']) {
+    assert.strictEqual(resolveModelSpec(id).wireId, id)
+  }
+})
+await check('retired gemini-3.1-pro-high wire id is gone', () => {
+  assert.ok(!MODEL_CATALOG.some(model => model.wireId === 'gemini-3.1-pro-high'))
+  assert.strictEqual(resolveModelSpec('gemini-3-pro').wireId, 'gemini-pro-agent')
+})
 await check('longest prefix wins', () => {
   assert.strictEqual(resolveModelSpec('gemini-2.5-pro-preview').id, 'gemini-2.5-pro')
 })

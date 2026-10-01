@@ -46,7 +46,9 @@ export interface UsageTokens {
  * entries) and cross-checked against per-model implied prices reverse-computed
  * from this machine's recorded spend: `SUM(cost_*)/SUM(tokens_*) * 1e6` matched
  * every model that had spend. They are an *estimate of API-equivalent value*,
- * not a bill: Antigravity is subscription-billed.
+ * not a bill: Antigravity is subscription-billed. The `gemini-3.6-flash`
+ * 三档 and `gemini-3.1-pro-low` mirror their family's base rate, because the
+ * upstream table prices no thinking tier separately.
  */
 export interface ModelPrice {
   input: number
@@ -83,8 +85,12 @@ export const DEFAULT_PRICING: Record<string, ModelPrice> = {
   'gemini-3.8-flash': { input: 0.75, output: 3.75, cacheRead: 0.075, cacheWrite: 0 },
   'gemini-3.7-flash': { input: 0.75, output: 3.75, cacheRead: 0.075, cacheWrite: 0 },
   'gemini-3.6-flash': { input: 0.75, output: 3.75, cacheRead: 0.075, cacheWrite: 0 },
+  'gemini-3.6-flash-high': { input: 0.75, output: 3.75, cacheRead: 0.075, cacheWrite: 0 },
+  'gemini-3.6-flash-medium': { input: 0.75, output: 3.75, cacheRead: 0.075, cacheWrite: 0 },
+  'gemini-3.6-flash-low': { input: 0.75, output: 3.75, cacheRead: 0.075, cacheWrite: 0 },
   'gemini-3.5-flash': { input: 1.5, output: 9, cacheRead: 0.15, cacheWrite: 0 },
   'gemini-3.1-pro': { input: 2, output: 12, cacheRead: 0.2, cacheWrite: 0 },
+  'gemini-3.1-pro-low': { input: 2, output: 12, cacheRead: 0.2, cacheWrite: 0 },
   'gemini-3-pro': { input: 2, output: 12, cacheRead: 0.2, cacheWrite: 0 },
   'gemini-2.5-flash': { input: 0.3, output: 2.5, cacheRead: 0.03, cacheWrite: 0 },
   'gemini-2.5-pro': { input: 1.25, output: 10, cacheRead: 0.125, cacheWrite: 0 },

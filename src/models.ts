@@ -77,6 +77,36 @@ export const MODEL_CATALOG: ModelEntry[] = [
     inputModalities: ['text', 'image']
   },
   {
+    id: 'gemini-3.6-flash-high',
+    wireId: 'gemini-3.6-flash-high',
+    name: 'Gemini 3.6 Flash (High)',
+    description: 'Gemini 3.6 Flash 高思考档',
+    contextWindow: 1048576,
+    maxTokens: 65536,
+    reasoning: true,
+    inputModalities: ['text', 'image']
+  },
+  {
+    id: 'gemini-3.6-flash-medium',
+    wireId: 'gemini-3.6-flash-medium',
+    name: 'Gemini 3.6 Flash (Medium)',
+    description: 'Gemini 3.6 Flash 中思考档',
+    contextWindow: 1048576,
+    maxTokens: 65536,
+    reasoning: true,
+    inputModalities: ['text', 'image']
+  },
+  {
+    id: 'gemini-3.6-flash-low',
+    wireId: 'gemini-3.6-flash-low',
+    name: 'Gemini 3.6 Flash (Low)',
+    description: 'Gemini 3.6 Flash 低思考档',
+    contextWindow: 1048576,
+    maxTokens: 65536,
+    reasoning: true,
+    inputModalities: ['text', 'image']
+  },
+  {
     id: 'gemini-3.5-flash',
     wireId: 'gemini-3.5-flash-low',
     name: 'Gemini 3.5 Flash',
@@ -97,10 +127,20 @@ export const MODEL_CATALOG: ModelEntry[] = [
     inputModalities: ['text', 'image']
   },
   {
+    id: 'gemini-3.1-pro-low',
+    wireId: 'gemini-3.1-pro-low',
+    name: 'Gemini 3.1 Pro (Low)',
+    description: 'Gemini 3.1 Pro 低思考档',
+    contextWindow: 1048576,
+    maxTokens: 65535,
+    reasoning: true,
+    inputModalities: ['text', 'image']
+  },
+  {
     id: 'gemini-3-pro',
-    wireId: 'gemini-3.1-pro-high',
+    wireId: 'gemini-pro-agent',
     name: 'Gemini 3 Pro',
-    description: '具备 1M 上下文的高性能 Pro 模型',
+    description: 'Gemini 3 Pro 兼容别名，实际路由到 Gemini 3.1 Pro (High)',
     contextWindow: 1048576,
     maxTokens: 65535,
     reasoning: true,
